@@ -54,6 +54,9 @@ _AGG_NUMS = ["est_birth_year", "min_total", "mecze", "gole", "kartki", "pm_score
 
 st.set_page_config(page_title="Raport rocznikowy · PlayMaker", layout="wide")
 
+# wykresy bez zoomu / paska narzędzi / pełnego ekranu
+PLOTLY_CFG = {"displayModeBar": False, "scrollZoom": False, "staticPlot": False}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WCZYTYWANIE
@@ -250,8 +253,8 @@ def fig_trend(pm_rows, cohort_median):
 # ─────────────────────────────────────────────────────────────────────────────
 # DOSTĘP (opcjonalne hasło — secret APP_PASSWORD)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_pdf(r, top_pdf, pm_rows, year, min_min):
-    """Jednostronicowy PDF dla zawodnika: PM Score, ranking rocznika, trend, Top 10."""
+def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
+    """Jednostronicowy PDF: PM Score, ranking, rozkład rocznika, trend, Top 10, wskazówki."""
     RED, GREEN, INK, GREY, BG = "#e2231a", "#22a06b", "#1b1f24", "#8a94a3", "#eef1f5"
     pm = float(r.get("pm_score") or 0) * 100
     elig = bool(r.get("eligible"))
@@ -259,32 +262,33 @@ def build_pdf(r, top_pdf, pm_rows, year, min_min):
     fig.patch.set_facecolor("white")
 
     # ── nagłówek ──
-    fig.text(0.07, 0.955, "RAPORT PLAYMAKER", fontsize=13, weight="bold", color=INK)
-    fig.text(0.93, 0.955, "playmaker.pro", fontsize=10, color=RED, ha="right", weight="bold")
-    fig.text(0.07, 0.915, str(r.get("zawodnik") or "—"), fontsize=22, weight="bold", color=INK)
+    fig.text(0.07, 0.960, "RAPORT PLAYMAKER", fontsize=13, weight="bold", color=INK)
+    fig.text(0.93, 0.960, "playmaker.pro", fontsize=10, color=RED, ha="right", weight="bold")
+    fig.text(0.07, 0.925, str(r.get("zawodnik") or "—"), fontsize=22, weight="bold", color=INK)
     meta = f"Rocznik {int(year)}   ·   {r.get('club_name') or '—'}   ·   {r.get('region_name') or '—'}"
-    fig.text(0.07, 0.888, meta, fontsize=11, color=GREY)
-    fig.add_artist(plt.Line2D([0.07, 0.93], [0.872, 0.872], color=BG, lw=2))
+    fig.text(0.07, 0.900, meta, fontsize=11, color=GREY)
+    fig.add_artist(plt.Line2D([0.07, 0.93], [0.885, 0.885], color=BG, lw=2))
 
     # ── donut PM Score ──
-    axd = fig.add_axes([0.07, 0.66, 0.28, 0.19])
+    axd = fig.add_axes([0.07, 0.70, 0.26, 0.15])
     axd.pie([pm, max(0.0, 100 - pm)], colors=[RED, BG], startangle=90,
             counterclock=False, wedgeprops=dict(width=0.34))
-    axd.text(0, 0.08, f"{pm:.0f}", ha="center", va="center", fontsize=30, weight="bold", color=INK)
-    axd.text(0, -0.28, "PM Score", ha="center", va="center", fontsize=11, color=GREY)
+    axd.text(0, 0.08, f"{pm:.0f}", ha="center", va="center", fontsize=28, weight="bold", color=INK)
+    axd.text(0, -0.30, "PM Score", ha="center", va="center", fontsize=11, color=GREY)
     axd.set(aspect="equal")
 
-    # ── rankingi (liczby) ──
+    # ── rankingi (liczby) — jednakowy rozmiar, pogrubiony tylko licznik ──
     if elig:
-        fig.text(0.45, 0.815, f"Ranking rocznika {int(year)}", fontsize=11, color=GREY)
-        fig.text(0.45, 0.755, f"{int(r['rank_nat'])}.", fontsize=34, weight="bold", color=INK)
-        fig.text(0.62, 0.762, f"/ {int(r['cohort_n'])} w Polsce", fontsize=12, color=GREY)
+        fig.text(0.42, 0.820, f"Ranking rocznika {int(year)}", fontsize=11, color=GREY)
+        line = f"{int(r['rank_nat'])}.  /  {int(r['cohort_n'])} w Polsce"
+        fig.text(0.42, 0.775, line, fontsize=17, color=INK)                       # cała linia (rezerwuje szerokość)
+        fig.text(0.42, 0.775, f"{int(r['rank_nat'])}.", fontsize=17, color=INK, weight="bold")  # pogrubiony licznik
         top = (1 - float(r["pctl"])) * 100
-        fig.text(0.45, 0.705, f"TOP {top:.0f}% rocznika w kraju", fontsize=13, weight="bold", color=RED)
+        fig.text(0.42, 0.725, f"TOP {top:.0f}% rocznika w kraju", fontsize=14, weight="bold", color=RED)
     else:
-        fig.text(0.45, 0.79, "Za mało minut na ranking krajowy", fontsize=12, color=GREY)
-        fig.text(0.45, 0.755, f"{int(r.get('min_total') or 0)} min", fontsize=22, weight="bold", color=INK)
-        fig.text(0.45, 0.715, f"(próg {min_min} min)", fontsize=11, color=GREY)
+        fig.text(0.42, 0.80, "Za mało minut na ranking krajowy", fontsize=12, color=GREY)
+        fig.text(0.42, 0.760, f"{int(r.get('min_total') or 0)} min", fontsize=20, weight="bold", color=INK)
+        fig.text(0.42, 0.725, f"(próg {min_min} min)", fontsize=11, color=GREY)
 
     # ── znaczniki ──
     badges = []
@@ -296,11 +300,26 @@ def build_pdf(r, top_pdf, pm_rows, year, min_min):
     if (r.get("clj_minutes") or 0) > 0:
         badges.append(f"{int(r['clj_minutes'])}' w CLJ")
     if badges:
-        fig.text(0.07, 0.632, "  ·  ".join(badges), fontsize=10.5, color=INK,
+        fig.text(0.07, 0.672, "  ·  ".join(badges), fontsize=10.5, color=INK,
                  bbox=dict(boxstyle="round,pad=0.4", fc=BG, ec="none"))
 
+    # ── rozkład rocznika: gdzie jesteś ──
+    fig.text(0.07, 0.640, "Gdzie jesteś na tle rocznika", fontsize=12, weight="bold", color=INK)
+    axh = fig.add_axes([0.07, 0.505, 0.86, 0.115])
+    if dist_scores is not None and len(dist_scores):
+        axh.hist(np.asarray(dist_scores, dtype=float) * 100, bins=40, color="#c9d2dc")
+        if elig:
+            axh.axvline(pm, color=RED, lw=2.4)
+            axh.text(pm, axh.get_ylim()[1] * 0.92, " tu jesteś", color=RED, fontsize=9, weight="bold")
+    axh.set_xlabel("PM Score", fontsize=8, color=GREY)
+    for s in ("top", "right", "left"):
+        axh.spines[s].set_visible(False)
+    axh.set_yticks([])
+    axh.tick_params(labelsize=8, colors=GREY)
+
     # ── trend formy ──
-    axt = fig.add_axes([0.07, 0.40, 0.86, 0.17])
+    fig.text(0.07, 0.472, "Trend PM Score", fontsize=12, weight="bold", color=INK)
+    axt = fig.add_axes([0.07, 0.345, 0.86, 0.105])
     slope_txt = "—"
     if pm_rows is not None and len(pm_rows):
         g = pm_rows.sort_values("match_date")
@@ -313,31 +332,35 @@ def build_pdf(r, top_pdf, pm_rows, year, min_min):
             b = np.polyfit(x[np.isfinite(y)], y[np.isfinite(y)], 1)[0] * 100
             arrow = "rośnie" if b > 0.05 else ("spada" if b < -0.05 else "stabilna")
             slope_txt = f"{arrow} {b:+.1f} / kolejkę"
-    axt.set_title("Trend PM Score", loc="left", fontsize=12, weight="bold", color=INK, pad=8)
-    axt.text(1.0, 1.02, slope_txt, transform=axt.transAxes, ha="right", fontsize=12,
-             weight="bold", color=GREEN)
+    fig.text(0.93, 0.472, slope_txt, ha="right", fontsize=12, weight="bold", color=GREEN)
     axt.set_xticks([])
     for s in ("top", "right", "left"):
         axt.spines[s].set_visible(False)
     axt.tick_params(labelsize=8, colors=GREY)
 
     # ── Top 10 rocznika ──
-    fig.text(0.07, 0.345, f"Top 10 rocznika {int(year)} w Polsce", fontsize=12, weight="bold", color=INK)
-    y0 = 0.315
+    fig.text(0.07, 0.310, f"Top 10 rocznika {int(year)} w Polsce", fontsize=12, weight="bold", color=INK)
+    fig.text(0.60, 0.310, "PM Score", fontsize=8.5, color=GREY)
+    y0 = 0.284
     for i, (rank, name, sc) in enumerate(top_pdf[:10]):
         mine = str(name) == str(r.get("zawodnik"))
         w = "bold" if mine else "normal"
         col = RED if mine else INK
-        fig.text(0.09, y0 - i * 0.026, f"{i + 1:>2}.", fontsize=10.5, color=GREY)
-        fig.text(0.15, y0 - i * 0.026, str(name), fontsize=10.5, color=col, weight=w)
-        fig.text(0.60, y0 - i * 0.026, f"{float(sc) * 100:.0f}", fontsize=10.5, color=col, weight=w)
-    fig.text(0.60, y0 + 0.02, "PM Score", fontsize=8.5, color=GREY)
+        fig.text(0.09, y0 - i * 0.0195, f"{i + 1:>2}.", fontsize=10, color=GREY)
+        fig.text(0.15, y0 - i * 0.0195, str(name), fontsize=10, color=col, weight=w)
+        fig.text(0.61, y0 - i * 0.0195, f"{float(sc) * 100:.0f}", fontsize=10, color=col, weight=w)
+
+    # ── jak podnieść PM Score ──
+    fig.text(0.07, 0.075, "Jak rosnąć w rankingu:", fontsize=10.5, weight="bold", color=INK)
+    tips = ("więcej minut  ·  mocniejsze rozgrywki (okręgówka/wojewódzka > klasa A/B/C, CLJ najwyżej)  ·  "
+            "gra w starszej kategorii  ·  minuty w seniorach")
+    fig.text(0.07, 0.055, tips, fontsize=8.5, color=GREY)
 
     # ── stopka ──
     foot = (f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. "
             f"Ranking krajowy wśród zawodników z min. {min_min} min. "
             f"Wygenerowano {_dt.date.today():%Y-%m-%d}.")
-    fig.text(0.07, 0.05, foot, fontsize=8, color=GREY, wrap=True)
+    fig.text(0.07, 0.028, foot, fontsize=7.5, color=GREY)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="pdf", bbox_inches=None)
@@ -401,6 +424,11 @@ def main():
     if not check_password():
         return
 
+    # ukryj przycisk pełnego ekranu na wykresach
+    st.markdown(
+        "<style>[data-testid='StyledFullScreenButton'],button[title='View fullscreen']"
+        "{display:none!important;}</style>", unsafe_allow_html=True)
+
     st.sidebar.header("Ustawienia")
     min_min = st.sidebar.slider("Min. minut do oceny", 0, 1500, MIN_MIN_DEFAULT, 50,
                                 help="Poniżej progu nie przypisujemy percentyla — za mała próba.")
@@ -443,11 +471,11 @@ def main():
         with c1:
             st.markdown(f"#### Jesteś w **TOP {top:.0f}%** rocznika w Polsce")
             st.metric("Miejsce w kraju (rocznik)", f"{int(r['rank_nat'])} / {int(r['cohort_n'])}")
-            st.plotly_chart(gfig, use_container_width=True)
+            st.plotly_chart(gfig, use_container_width=True, config=PLOTLY_CFG)
         with c2:
             st.markdown("#### Gdzie jesteś na tle rocznika")
             st.plotly_chart(fig_distribution(df.loc[df["eligible"], "pm_score"], r["pm_score"]),
-                            use_container_width=True)
+                            use_container_width=True, config=PLOTLY_CFG)
 
     badges = []
     if bool(r.get("gra_ze_starszymi")):
@@ -466,7 +494,7 @@ def main():
     with c3:
         st.markdown("#### Profil na tle rocznika")
         if r["eligible"]:
-            st.plotly_chart(fig_radar(r), use_container_width=True)
+            st.plotly_chart(fig_radar(r), use_container_width=True, config=PLOTLY_CFG)
             st.caption("Każda oś: percentyl w roczniku (100 = najlepszy w Polsce).")
         else:
             st.caption("Profil percentylowy dostępny po przekroczeniu progu minut.")
@@ -475,7 +503,7 @@ def main():
         pm_rows = trend[trend["player_id"] == pid] if trend is not None and not trend.empty else pd.DataFrame()
         med = df.loc[df["eligible"], "pm_score"].median() if r["eligible"] else np.nan
         if len(pm_rows):
-            st.plotly_chart(fig_trend(pm_rows, med), use_container_width=True)
+            st.plotly_chart(fig_trend(pm_rows, med), use_container_width=True, config=PLOTLY_CFG)
             if pd.notna(r.get("forma")):
                 arrow = "↗ rośnie" if r["forma"] > 0.03 else ("↘ spada" if r["forma"] < -0.03 else "→ stabilna")
                 st.caption(f"Ostatnie mecze vs średnia sezonu: **{arrow}**.")
@@ -519,13 +547,28 @@ def main():
     top_pdf = (df[df["eligible"]].sort_values("pm_score", ascending=False).head(10)
                [["rank_nat", "zawodnik", "pm_score"]].values.tolist())
     pm_rows = trend[trend["player_id"] == pid] if trend is not None and not trend.empty else pd.DataFrame()
+    dist_scores = df.loc[df["eligible"], "pm_score"].to_numpy()
     try:
-        pdf_bytes = build_pdf(r, top_pdf, pm_rows, year, min_min)
+        pdf_bytes = build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min)
         safe = "".join(ch if ch.isalnum() else "_" for ch in str(r["zawodnik"])).strip("_")
         st.download_button("⬇️ Pobierz PDF zawodnika", pdf_bytes,
                            file_name=f"raport_{safe}_{int(year)}.pdf", mime="application/pdf")
     except Exception as e:
         st.warning(f"Nie udało się zbudować PDF: {e}")
+
+    with st.expander("Jak podnieść PM Score? (kierunki rozwoju)"):
+        st.markdown(
+            "PM Score rośnie, gdy zawodnik:\n\n"
+            "- **gra w mocniejszych rozgrywkach** — poziom ligi jest mnożnikiem oceny "
+            "(klasa okręgowa/wojewódzka > klasa A/B/C juniorska; CLJ najwyżej),\n"
+            "- **gra w starszej kategorii** niż własny rocznik — premia za granie w górę,\n"
+            "- **łapie minuty w seniorach** (dla juniorów dodatkowa premia),\n"
+            "- **ma więcej rozegranych minut** — regularność gry realnie podnosi wynik,\n"
+            "- **gra w wygrywającym zespole / na wyjeździe** — część oceny zależy od wyniku i strony "
+            "boiska (to akurat mniej zależy od samego zawodnika).\n\n"
+            "Innymi słowy profil idealny: **regularny gracz mocnej drużyny, występujący powyżej "
+            "swojego rocznika, z minutami w seniorach.**"
+        )
 
     with st.expander("Jak liczymy PM Score i ten ranking?"):
         st.markdown(

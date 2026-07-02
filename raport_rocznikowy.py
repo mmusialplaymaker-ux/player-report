@@ -25,6 +25,12 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
+import io
+import datetime as _dt
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # scoring i helpery z istniejącej apki (UI app.py jest pod main() → import bezpieczny)
 from app import compute_pm_score, _coerce, _cat_maxyear_series, _secret
 
@@ -244,6 +250,102 @@ def fig_trend(pm_rows, cohort_median):
 # ─────────────────────────────────────────────────────────────────────────────
 # DOSTĘP (opcjonalne hasło — secret APP_PASSWORD)
 # ─────────────────────────────────────────────────────────────────────────────
+def build_pdf(r, top_pdf, pm_rows, year, min_min):
+    """Jednostronicowy PDF dla zawodnika: PM Score, ranking rocznika, trend, Top 10."""
+    RED, GREEN, INK, GREY, BG = "#e2231a", "#22a06b", "#1b1f24", "#8a94a3", "#eef1f5"
+    pm = float(r.get("pm_score") or 0) * 100
+    elig = bool(r.get("eligible"))
+    fig = plt.figure(figsize=(8.27, 11.69), dpi=150)  # A4
+    fig.patch.set_facecolor("white")
+
+    # ── nagłówek ──
+    fig.text(0.07, 0.955, "RAPORT PLAYMAKER", fontsize=13, weight="bold", color=INK)
+    fig.text(0.93, 0.955, "playmaker.pro", fontsize=10, color=RED, ha="right", weight="bold")
+    fig.text(0.07, 0.915, str(r.get("zawodnik") or "—"), fontsize=22, weight="bold", color=INK)
+    meta = f"Rocznik {int(year)}   ·   {r.get('club_name') or '—'}   ·   {r.get('region_name') or '—'}"
+    fig.text(0.07, 0.888, meta, fontsize=11, color=GREY)
+    fig.add_artist(plt.Line2D([0.07, 0.93], [0.872, 0.872], color=BG, lw=2))
+
+    # ── donut PM Score ──
+    axd = fig.add_axes([0.07, 0.66, 0.28, 0.19])
+    axd.pie([pm, max(0.0, 100 - pm)], colors=[RED, BG], startangle=90,
+            counterclock=False, wedgeprops=dict(width=0.34))
+    axd.text(0, 0.08, f"{pm:.0f}", ha="center", va="center", fontsize=30, weight="bold", color=INK)
+    axd.text(0, -0.28, "PM Score", ha="center", va="center", fontsize=11, color=GREY)
+    axd.set(aspect="equal")
+
+    # ── rankingi (liczby) ──
+    if elig:
+        fig.text(0.45, 0.815, f"Ranking rocznika {int(year)}", fontsize=11, color=GREY)
+        fig.text(0.45, 0.755, f"{int(r['rank_nat'])}.", fontsize=34, weight="bold", color=INK)
+        fig.text(0.62, 0.762, f"/ {int(r['cohort_n'])} w Polsce", fontsize=12, color=GREY)
+        top = (1 - float(r["pctl"])) * 100
+        fig.text(0.45, 0.705, f"TOP {top:.0f}% rocznika w kraju", fontsize=13, weight="bold", color=RED)
+    else:
+        fig.text(0.45, 0.79, "Za mało minut na ranking krajowy", fontsize=12, color=GREY)
+        fig.text(0.45, 0.755, f"{int(r.get('min_total') or 0)} min", fontsize=22, weight="bold", color=INK)
+        fig.text(0.45, 0.715, f"(próg {min_min} min)", fontsize=11, color=GREY)
+
+    # ── znaczniki ──
+    badges = []
+    if bool(r.get("gra_ze_starszymi")):
+        n = r.get("roczniki_w_gore")
+        badges.append(f"gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "gra ze starszymi")
+    if (r.get("senior_minutes") or 0) > 0:
+        badges.append(f"{int(r['senior_minutes'])}' w seniorach")
+    if (r.get("clj_minutes") or 0) > 0:
+        badges.append(f"{int(r['clj_minutes'])}' w CLJ")
+    if badges:
+        fig.text(0.07, 0.632, "  ·  ".join(badges), fontsize=10.5, color=INK,
+                 bbox=dict(boxstyle="round,pad=0.4", fc=BG, ec="none"))
+
+    # ── trend formy ──
+    axt = fig.add_axes([0.07, 0.40, 0.86, 0.17])
+    slope_txt = "—"
+    if pm_rows is not None and len(pm_rows):
+        g = pm_rows.sort_values("match_date")
+        y = pd.to_numeric(g["_sc"], errors="coerce").to_numpy()
+        roll = pd.Series(y).rolling(3, min_periods=1).mean().to_numpy()
+        x = np.arange(len(y))
+        axt.plot(x, y, marker="o", ms=3, lw=0, color="#c9d2dc")
+        axt.plot(x, roll, lw=2.4, color=GREEN)
+        if len(y) >= 3 and np.isfinite(y).sum() >= 3:
+            b = np.polyfit(x[np.isfinite(y)], y[np.isfinite(y)], 1)[0] * 100
+            arrow = "rośnie" if b > 0.05 else ("spada" if b < -0.05 else "stabilna")
+            slope_txt = f"{arrow} {b:+.1f} / kolejkę"
+    axt.set_title("Trend PM Score", loc="left", fontsize=12, weight="bold", color=INK, pad=8)
+    axt.text(1.0, 1.02, slope_txt, transform=axt.transAxes, ha="right", fontsize=12,
+             weight="bold", color=GREEN)
+    axt.set_xticks([])
+    for s in ("top", "right", "left"):
+        axt.spines[s].set_visible(False)
+    axt.tick_params(labelsize=8, colors=GREY)
+
+    # ── Top 10 rocznika ──
+    fig.text(0.07, 0.345, f"Top 10 rocznika {int(year)} w Polsce", fontsize=12, weight="bold", color=INK)
+    y0 = 0.315
+    for i, (rank, name, sc) in enumerate(top_pdf[:10]):
+        mine = str(name) == str(r.get("zawodnik"))
+        w = "bold" if mine else "normal"
+        col = RED if mine else INK
+        fig.text(0.09, y0 - i * 0.026, f"{i + 1:>2}.", fontsize=10.5, color=GREY)
+        fig.text(0.15, y0 - i * 0.026, str(name), fontsize=10.5, color=col, weight=w)
+        fig.text(0.60, y0 - i * 0.026, f"{float(sc) * 100:.0f}", fontsize=10.5, color=col, weight=w)
+    fig.text(0.60, y0 + 0.02, "PM Score", fontsize=8.5, color=GREY)
+
+    # ── stopka ──
+    foot = (f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. "
+            f"Ranking krajowy wśród zawodników z min. {min_min} min. "
+            f"Wygenerowano {_dt.date.today():%Y-%m-%d}.")
+    fig.text(0.07, 0.05, foot, fontsize=8, color=GREY, wrap=True)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="pdf", bbox_inches=None)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def check_password():
     pw = _secret("APP_PASSWORD", "")
     if not pw:
@@ -411,6 +513,19 @@ def main():
     def _hl(row):
         return ["background-color:#1c3a4a" if row["Zawodnik"] == r["zawodnik"] else "" for _ in row]
     st.dataframe(top10.style.apply(_hl, axis=1), hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### Raport PDF dla zawodnika")
+    top_pdf = (df[df["eligible"]].sort_values("pm_score", ascending=False).head(10)
+               [["rank_nat", "zawodnik", "pm_score"]].values.tolist())
+    pm_rows = trend[trend["player_id"] == pid] if trend is not None and not trend.empty else pd.DataFrame()
+    try:
+        pdf_bytes = build_pdf(r, top_pdf, pm_rows, year, min_min)
+        safe = "".join(ch if ch.isalnum() else "_" for ch in str(r["zawodnik"])).strip("_")
+        st.download_button("⬇️ Pobierz PDF zawodnika", pdf_bytes,
+                           file_name=f"raport_{safe}_{int(year)}.pdf", mime="application/pdf")
+    except Exception as e:
+        st.warning(f"Nie udało się zbudować PDF: {e}")
 
     with st.expander("Jak liczymy PM Score i ten ranking?"):
         st.markdown(

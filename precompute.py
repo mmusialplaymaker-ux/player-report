@@ -6,11 +6,12 @@ Z dużego match-level `kohorta.csv` robi dwa MAŁE pliki, które idą do repo/ch
   • kohorta_trend.csv.gz  — minimalne wiersze meczowe (player_id, match_date, minutes, _sc)
                             tylko do wykresu formy; tylko mecze z minutami > 0
 
-Dzięki temu apka nie ładuje już całego match-level. PM Score liczony tym samym wzorem
-co wszędzie (import compute_pm_score z app.py).
+Wyklucza dziewczynki (raport jest o roczniku chłopców) — heurystyką imion na „-a"
+minus lista męskich wyjątków. PM Score liczony tym samym wzorem co wszędzie
+(import compute_pm_score z app.py).
 
 Uruchomienie:
-    pip install pandas numpy
+    pip install pandas numpy streamlit
     python precompute.py                 # czyta kohorta.csv
     python precompute.py sciezka.csv     # albo inny plik źródłowy
 """
@@ -23,17 +24,44 @@ from app import compute_pm_score, _coerce, _cat_maxyear_series
 
 SRC = sys.argv[1] if len(sys.argv) > 1 else "kohorta.csv"
 
-print(f"Wczytuję {SRC} ...")
+# ── męskie wyjątki: imiona kończące się na „-a", które NIE są kobiece ──────────
+MALE_EXCEPTIONS = {
+    # utrzymywana lista (slim_data.py)
+    "kuba", "luka", "nikita", "barnaba", "ilia", "illya", "mikita",
+    "danila", "oleksa", "seva", "diaa",
+    # dodatkowe warianty zaobserwowane w tym pliku — ZAUDYTUJ / edytuj wg potrzeb:
+    "dima", "mykola", "mykyta", "ilya", "illia",
+}
+
+
+def _is_female(firstname):
+    f = str(firstname).strip().lower()
+    return f.endswith("a") and f not in MALE_EXCEPTIONS
+
+
 def _read_any(path):
-    for enc in ("utf-8-sig", "cp1250", "latin-1"):
+    for enc in ("cp1250", "utf-8-sig", "latin-1"):
         try:
             return pd.read_csv(path, encoding=enc, low_memory=False)
         except (UnicodeDecodeError, UnicodeError):
             continue
     raise SystemExit("Nie udało się odczytać CSV (kodowanie).")
 
+
+print(f"Wczytuję {SRC} ...")
 m = _coerce(_read_any(SRC))
-print(f"  {len(m)} wierszy meczowych, {m['player_id'].nunique()} zawodników")
+n0 = m["player_id"].nunique()
+
+# ── odrzuć dziewczynki (na poziomie zawodnika) ────────────────────────────────
+fem_mask = m["firstname"].map(_is_female)
+removed_names = sorted(m.loc[fem_mask, "firstname"].dropna().str.strip().str.title().unique())
+m = m[~fem_mask].copy()
+n1 = m["player_id"].nunique()
+print(f"  {len(m)} wierszy meczowych, {n1} zawodników "
+      f"(odrzucono {n0 - n1} dziewczynek z {n0})")
+if removed_names:
+    print("  przykłady odrzuconych imion:", ", ".join(removed_names[:25])
+          + (" ..." if len(removed_names) > 25 else ""))
 
 m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()
 comp = compute_pm_score(m)
@@ -76,7 +104,7 @@ def _form(g):
                       "kons": (1 / (1 + x.std(ddof=0))) if len(x) >= 2 else np.nan})
 
 
-out = out.join(gp.apply(_form))
+out = out.join(gp[["match_date", "_sp"]].apply(_form))
 
 py = m["est_birth_year"]
 jun_older = (mn > 0) & m["_maxy"].notna() & py.notna() & (py > m["_maxy"])
@@ -93,7 +121,6 @@ out["kategorie"] = gp["league_name"].agg(lambda s: "; ".join(sorted(set(s.dropna
 out = out.reset_index()
 out.to_csv("kohorta_agg.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
 
-# trend: tylko to, czego potrzebuje wykres formy; tylko zagrane mecze → mniejszy plik
 trend = pd.DataFrame({"player_id": m["player_id"], "match_date": m["match_date"],
                       "minutes": mn, "_sc": m["_sc"]})
 trend = trend[trend["minutes"] > 0]

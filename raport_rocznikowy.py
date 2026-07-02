@@ -2,28 +2,22 @@
 raport_rocznikowy.py
 ────────────────────
 Raport rocznikowy PlayMaker: gdzie zawodnik jest na tle CAŁEGO rocznika w Polsce.
-Odbiorca: zawodnik / rodzic (rodzic płaci). Nacisk na jasny werdykt + kierunek rozwoju,
-nie na tabelę metryk.
+Odbiorca: zawodnik / rodzic (rodzic płaci). Werdykt + kierunek rozwoju, nie tabela metryk.
 
-JEDNO ŹRÓDŁO PRAWDY DLA SCORE:
-    importujemy compute_pm_score() i helpery wprost z app.py — ten sam wzór PM Score 2.0,
-    league-aware (leagueMultiplier zależny od poziomu) + ageDiscount (premia za grę wyżej).
-    Dzięki temu krajowy ranking rocznika jest porównywalny między ligami: dobra gra w słabej
-    lidze daje niższy mnożnik niż ta sama gra w CLJ. To rozwiązuje cross-league comparability.
-
-DANE WEJŚCIOWE (per mecz), z kohorta_rocznik.sql:
-    player_id, firstname, lastname, match_id, match_date, play_id, play_name, region_name,
-    league_id, league_name, team_id, team_name, club_id, club_name,
-    minutes, goals, yellow_cards, red_cards, match_result, team_side,
-    player_age, est_birth_year, age_at_match, is_junior_comp   [, position — opcjonalnie]
+DWA TRYBY DANYCH:
+  1) PRECOMPUTED (domyślny, pod chmurę): czyta małe pliki wygenerowane przez precompute.py
+       • kohorta_agg.csv.gz    — 1 wiersz/zawodnik (cała kohorta → realne N)
+       • kohorta_trend.csv.gz  — minimalne wiersze meczowe do wykresu formy
+     Apka nie ładuje całego match-level — percentyle z agregatu, trend tylko dla wybranego.
+  2) FALLBACK match-level (lokalnie): gdy nie ma kohorta_agg.csv.gz, liczy z kohorta.csv / DB
+     tym samym wzorem (compute_pm_score z app.py).
 
 URUCHOMIENIE:
-    pip install streamlit pandas numpy plotly psycopg2-binary
+    pip install streamlit pandas numpy plotly
+    python precompute.py           # raz, lokalnie — robi male pliki z duzego kohorta.csv
     streamlit run raport_rocznikowy.py
-    # tryb CSV (domyślny): plik kohorta.csv (jeden lub wiele roczników — filtr po est_birth_year)
-    # tryb DB: secret PM_DATA_MODE=db + PGHOST/PGDATABASE/PGUSER/PGPASSWORD/PGPORT + PM_SEASON_ID
 
-DOSTĘP PER-LINK (dane nieletnich): ?player=<player_id> pokazuje od razu danego zawodnika.
+DEEP-LINK: ?player=<player_id> otwiera od razu danego zawodnika.
 """
 import os
 import numpy as np
@@ -31,27 +25,35 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# ── scoring i helpery z istniejącej apki (bez odpalania jej UI — jest pod main()) ──
+# scoring i helpery z istniejącej apki (UI app.py jest pod main() → import bezpieczny)
 from app import compute_pm_score, _coerce, _cat_maxyear_series, _secret
 
 CURRENT_SEASON = _secret("PM_SEASON_ID", "e9d66181-d03e-4bb3-b889-4da848f4831d")
 DATA_MODE = (_secret("PM_DATA_MODE", "csv") or "csv").lower()
 MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "300") or "300"))
 
-# rocznik → nazwa kategorii PZPN (sezon 25/26). Kategoria macierzysta = wpis dla własnego rocznika.
+AGG_PATH = _secret("PM_AGG_CSV", "kohorta_agg.csv.gz")
+TREND_PATH = _secret("PM_TREND_CSV", "kohorta_trend.csv.gz")
+COHORT_CSV = _secret("PM_COHORT_CSV", "kohorta.csv")
+
 PZPN_CAT = {2006: "A1 / U-19", 2007: "A2 / U-18", 2008: "B1 / U-17", 2009: "B2 / U-16",
             2010: "C1 / U-15", 2011: "C2 / U-14", 2012: "D1 / U-13", 2013: "D2 / U-12",
             2014: "E1 / U-11", 2015: "E2 / U-10", 2016: "F1 / U-9", 2017: "F2 / U-8"}
 
 DIMS = ["Jakość gry", "Skuteczność", "Regularność gry", "Równość formy", "Dyscyplina"]
 
+_AGG_NUMS = ["est_birth_year", "min_total", "mecze", "gole", "kartki", "pm_score", "pm_quality",
+             "gole_per90", "kartki_per90", "forma", "kons", "roczniki_w_gore",
+             "clj_minutes", "senior_minutes"]
+
 st.set_page_config(page_title="Raport rocznikowy · PlayMaker", layout="wide")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ŁADOWANIE DANYCH
+# WCZYTYWANIE
 # ─────────────────────────────────────────────────────────────────────────────
 def _read_csv(path):
+    # pandas sam wykryje gzip po rozszerzeniu .gz
     for enc in ("utf-8", "utf-8-sig", "cp1250", "latin-1"):
         try:
             return pd.read_csv(path, encoding=enc)
@@ -61,7 +63,29 @@ def _read_csv(path):
 
 
 @st.cache_data(show_spinner=False)
-def load_cohort_csv(path="kohorta.csv"):
+def load_agg(path):
+    df = _read_csv(path)
+    for c in _AGG_NUMS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "gra_ze_starszymi" in df.columns:
+        df["gra_ze_starszymi"] = (df["gra_ze_starszymi"].astype(str).str.strip().str.lower()
+                                  .isin(["true", "1", "t", "yes"]))
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_trend(path):
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["player_id", "match_date", "minutes", "_sc"])
+    df = _read_csv(path)
+    df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
+    df["_sc"] = pd.to_numeric(df["_sc"], errors="coerce")
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_cohort_csv(path):
     return _coerce(_read_csv(path))
 
 
@@ -70,12 +94,8 @@ def load_cohort_db(season_id, birth_year):
     import psycopg2
     import re
     sql = open("kohorta_rocznik.sql", encoding="utf-8").read()
-    # Wstrzyknij sezon + rocznik do bloku params (SQL jest uruchamialny też wprost,
-    # z wartościami domyślnymi — apka je tu nadpisuje wyborem z panelu).
-    sql = re.sub(r"'[^']*'::text\s+AS season_id",
-                 f"'{season_id}'::text AS season_id", sql, count=1)
-    sql = re.sub(r"\b\d{4}::int\s+AS birth_year",
-                 f"{int(birth_year)}::int AS birth_year", sql, count=1)
+    sql = re.sub(r"'[^']*'::text\s+AS season_id", f"'{season_id}'::text AS season_id", sql, count=1)
+    sql = re.sub(r"\b\d{4}::int\s+AS birth_year", f"{int(birth_year)}::int AS birth_year", sql, count=1)
     conn = psycopg2.connect(host=_secret("PGHOST"), dbname=_secret("PGDATABASE"),
                             user=_secret("PGUSER"), password=_secret("PGPASSWORD"),
                             port=_secret("PGPORT", "5432") or "5432")
@@ -85,18 +105,18 @@ def load_cohort_db(season_id, birth_year):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BUDOWA KOHORTY (metryki bazowe per zawodnik) — cache; percentyle liczone osobno
+# AGREGACJA match-level → per zawodnik (używane TYLKO w trybie fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def build_cohort(m):
     m = m.copy()
     m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()
     comp = compute_pm_score(m)
-    m["_sc"] = comp["score"].values          # pełny PM Score (age_part + stats_part), 0..1
-    m["_sp"] = comp["stats_part"].values     # league + performance (bez wieku)
+    m["_sc"] = comp["score"].values
+    m["_sp"] = comp["stats_part"].values
     mn = pd.to_numeric(m["minutes"], errors="coerce").fillna(0)
     m["_mn"] = mn
-    m["_maxy"] = _cat_maxyear_series(m)       # max rocznik dywizji (PZPN) per mecz
+    m["_maxy"] = _cat_maxyear_series(m)
 
     gp = m.groupby("player_id")
     den = mn.groupby(m["player_id"]).sum().replace(0, np.nan)
@@ -116,13 +136,10 @@ def build_cohort(m):
     out["pm_quality"] = wmean("_sp")
     out["gole_per90"] = (out["gole"] / out["min_total"] * 90).replace([np.inf, -np.inf], np.nan)
     out["kartki_per90"] = (out["kartki"] / out["min_total"] * 90).replace([np.inf, -np.inf], np.nan)
-
-    # klub / region / liga wiodąca = najwięcej minut
     lead = (m.sort_values("_mn", ascending=False)
             .groupby("player_id")[["club_name", "region_name", "league_name"]].first())
     out = out.join(lead)
 
-    # forma (ostatnie 5 vs średnia) i konsekwencja (stabilność) ze stats_part
     def _form(g):
         x = g.sort_values("match_date")["_sp"].dropna()
         mm = x.mean()
@@ -130,19 +147,18 @@ def build_cohort(m):
                           "kons": (1 / (1 + x.std(ddof=0))) if len(x) >= 2 else np.nan})
     out = out.join(gp.apply(_form))
 
-    # gra ze starszymi: własny rocznik > max rocznik dywizji (grał, minuty>0)
     py = m["est_birth_year"]
     jun_older = (mn > 0) & m["_maxy"].notna() & py.notna() & (py > m["_maxy"])
     out["roczniki_w_gore"] = (py - m["_maxy"]).where(jun_older).groupby(m["player_id"]).max()
     out["gra_ze_starszymi"] = jun_older.groupby(m["player_id"]).any().reindex(out.index).fillna(False)
-    # minuty w CLJ / w seniorach — sygnały poziomu (do znaczników)
     is_clj = m["league_name"].astype(str).str.contains(r"\bCLJ\b|Centralna Liga Junior", case=False, regex=True, na=False)
     out["clj_minutes"] = (mn * is_clj).groupby(m["player_id"]).sum()
     is_senior = (~m["is_junior_comp"].fillna(False)) & (m["age_at_match"].between(12, 19))
     out["senior_minutes"] = (mn * is_senior).groupby(m["player_id"]).sum()
+    out["kategorie"] = gp["league_name"].agg(lambda s: "; ".join(sorted(set(s.dropna().astype(str)))))
 
-    out["kategorie"] = gp["league_name"].agg(lambda s: sorted(set(s.dropna().astype(str))))
-    return out.reset_index(), m
+    scored = m[["player_id", "match_date", "_sc", "minutes"]].copy()
+    return out.reset_index(), scored
 
 
 def apply_percentiles(base, min_min):
@@ -183,8 +199,7 @@ def fig_gauge(pctl):
 
 def fig_distribution(sub_scores, player_score):
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=sub_scores, nbinsx=40, marker_color="#2b3b4d",
-                               name="rocznik"))
+    fig.add_trace(go.Histogram(x=sub_scores, nbinsx=40, marker_color="#2b3b4d", name="rocznik"))
     fig.add_vline(x=player_score, line_color="#5db0ff", line_width=3,
                   annotation_text="tu jesteś", annotation_position="top",
                   annotation_font_color="#5db0ff")
@@ -203,7 +218,8 @@ def fig_radar(row):
     fig.update_layout(height=340, margin=dict(l=40, r=40, t=30, b=20),
                       paper_bgcolor="rgba(0,0,0,0)", font_color="#cdd6e0",
                       polar=dict(bgcolor="rgba(0,0,0,0)",
-                                 radialaxis=dict(range=[0, 100], showticklabels=True, tickvals=[25, 50, 75, 100])))
+                                 radialaxis=dict(range=[0, 100], showticklabels=True,
+                                                 tickvals=[25, 50, 75, 100])))
     return fig
 
 
@@ -215,8 +231,9 @@ def fig_trend(pm_rows, cohort_median):
                              marker=dict(size=6, color="#3b4b5d"), name="mecz"))
     fig.add_trace(go.Scatter(x=g["match_date"], y=roll, mode="lines",
                              line=dict(color="#5db0ff", width=3), name="forma (3 mecze)"))
-    fig.add_hline(y=cohort_median, line_dash="dash", line_color="#f5c451",
-                  annotation_text="mediana rocznika", annotation_font_color="#f5c451")
+    if pd.notna(cohort_median):
+        fig.add_hline(y=cohort_median, line_dash="dash", line_color="#f5c451",
+                      annotation_text="mediana rocznika", annotation_font_color="#f5c451")
     fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                       font_color="#cdd6e0", legend=dict(orientation="h", y=1.15),
@@ -225,7 +242,7 @@ def fig_trend(pm_rows, cohort_median):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOSTĘP (opcjonalne hasło — spójne z Almanachem: secret APP_PASSWORD)
+# DOSTĘP (opcjonalne hasło — secret APP_PASSWORD)
 # ─────────────────────────────────────────────────────────────────────────────
 def check_password():
     pw = _secret("APP_PASSWORD", "")
@@ -244,6 +261,38 @@ def check_password():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DANE: precomputed jeśli jest, inaczej fallback match-level
+# ─────────────────────────────────────────────────────────────────────────────
+def get_year_and_data(year_widget_key="rok"):
+    precomputed = os.path.exists(AGG_PATH)
+    if precomputed:
+        agg = load_agg(AGG_PATH)
+        years = sorted(pd.to_numeric(agg["est_birth_year"], errors="coerce").dropna().astype(int).unique())
+        if not years:
+            return None, None, None
+        year = st.sidebar.selectbox("Rocznik", years, index=len(years) - 1, key=year_widget_key)
+        base = agg[pd.to_numeric(agg["est_birth_year"], errors="coerce") == year].copy()
+        trend_all = load_trend(TREND_PATH)
+        trend = (trend_all[trend_all["player_id"].isin(set(base["player_id"]))]
+                 if not trend_all.empty else trend_all)
+        return year, base, trend
+
+    # fallback (lokalnie): match-level z DB albo dużego CSV
+    if DATA_MODE == "db":
+        year = st.sidebar.number_input("Rocznik", 2004, 2018, 2010, 1, key=year_widget_key)
+        raw = load_cohort_db(CURRENT_SEASON, int(year))
+    else:
+        raw = load_cohort_csv(COHORT_CSV)
+        years = sorted(pd.to_numeric(raw["est_birth_year"], errors="coerce").dropna().astype(int).unique())
+        year = st.sidebar.selectbox("Rocznik", years, index=len(years) - 1, key=year_widget_key)
+        raw = raw[pd.to_numeric(raw["est_birth_year"], errors="coerce") == year].copy()
+    if raw.empty:
+        return year, raw, None
+    base, trend = build_cohort(raw)
+    return year, base, trend
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GŁÓWNY WIDOK
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -254,22 +303,15 @@ def main():
     min_min = st.sidebar.slider("Min. minut do oceny", 0, 1500, MIN_MIN_DEFAULT, 50,
                                 help="Poniżej progu nie przypisujemy percentyla — za mała próba.")
 
-    # wybór rocznika + wczytanie kohorty
-    if DATA_MODE == "db":
-        year = st.sidebar.number_input("Rocznik", 2004, 2018, 2010, 1)
-        raw = load_cohort_db(CURRENT_SEASON, int(year))
-    else:
-        raw = load_cohort_csv(_secret("PM_COHORT_CSV", "kohorta.csv"))
-        years = sorted(pd.to_numeric(raw["est_birth_year"], errors="coerce").dropna().astype(int).unique())
-        year = st.sidebar.selectbox("Rocznik", years, index=max(0, len(years) - 1))
-        raw = raw[pd.to_numeric(raw["est_birth_year"], errors="coerce") == year].copy()
-
-    if raw.empty:
-        st.warning("Brak danych dla wybranego rocznika.")
+    year, base, trend = get_year_and_data()
+    if base is None or base.empty:
+        st.warning("Brak danych. W trybie chmurowym potrzebny jest kohorta_agg.csv.gz "
+                   "(wygeneruj lokalnie: python precompute.py).")
         return
 
-    base, scored = build_cohort(raw)
     df = apply_percentiles(base, min_min)
+    n_all = len(df)
+    n_elig = int(df["eligible"].sum())
 
     # wybór zawodnika (per-link ?player=<id> albo z listy)
     qp_player = st.query_params.get("player")
@@ -283,10 +325,11 @@ def main():
 
     r = df[df["player_id"] == pid].iloc[0]
 
-    # ── NAGŁÓWEK ──
     st.markdown(f"### {r['zawodnik']}")
-    st.caption(f"Rocznik {int(year)} · {r.get('club_name') or '—'} · "
-               f"{r.get('region_name') or '—'} · liga wiodąca: {r.get('league_name') or '—'}")
+    st.caption(f"Rocznik {int(year)} · {r.get('club_name') or '—'} · {r.get('region_name') or '—'} · "
+               f"liga wiodąca: {r.get('league_name') or '—'}")
+    st.caption(f"W rankingu rocznika: **{n_all}** zawodników w bazie, **{n_elig}** z wiarygodną próbą "
+               f"(≥ {min_min} min).")
 
     if not r["eligible"]:
         st.info(f"⚠️ Za mało minut na wiarygodną ocenę w skali kraju "
@@ -297,16 +340,13 @@ def main():
         c1, c2 = st.columns([1, 1.3])
         with c1:
             st.markdown(f"#### Jesteś w **TOP {top:.0f}%** rocznika w Polsce")
-            st.metric("Miejsce w kraju (rocznik)",
-                      f"{int(r['rank_nat'])} / {int(r['cohort_n'])}")
+            st.metric("Miejsce w kraju (rocznik)", f"{int(r['rank_nat'])} / {int(r['cohort_n'])}")
             st.plotly_chart(gfig, use_container_width=True)
         with c2:
             st.markdown("#### Gdzie jesteś na tle rocznika")
-            sub = df[df["eligible"]]
-            st.plotly_chart(fig_distribution(sub["pm_score"], r["pm_score"]),
+            st.plotly_chart(fig_distribution(df.loc[df["eligible"], "pm_score"], r["pm_score"]),
                             use_container_width=True)
 
-    # znaczniki kontekstu
     badges = []
     if bool(r.get("gra_ze_starszymi")):
         n = r.get("roczniki_w_gore")
@@ -320,7 +360,6 @@ def main():
 
     st.divider()
 
-    # ── PROFIL (radar) + TREND ──
     c3, c4 = st.columns(2)
     with c3:
         st.markdown("#### Profil na tle rocznika")
@@ -331,37 +370,42 @@ def main():
             st.caption("Profil percentylowy dostępny po przekroczeniu progu minut.")
     with c4:
         st.markdown("#### Trend formy (sezon)")
-        pm_rows = scored[scored["player_id"] == pid]
-        med = df.loc[df["eligible"], "pm_score"].median()
-        st.plotly_chart(fig_trend(pm_rows, med), use_container_width=True)
-        if pd.notna(r.get("forma")):
-            arrow = "↗ rośnie" if r["forma"] > 0.03 else ("↘ spada" if r["forma"] < -0.03 else "→ stabilna")
-            st.caption(f"Ostatnie mecze vs średnia sezonu: **{arrow}**.")
+        pm_rows = trend[trend["player_id"] == pid] if trend is not None and not trend.empty else pd.DataFrame()
+        med = df.loc[df["eligible"], "pm_score"].median() if r["eligible"] else np.nan
+        if len(pm_rows):
+            st.plotly_chart(fig_trend(pm_rows, med), use_container_width=True)
+            if pd.notna(r.get("forma")):
+                arrow = "↗ rośnie" if r["forma"] > 0.03 else ("↘ spada" if r["forma"] < -0.03 else "→ stabilna")
+                st.caption(f"Ostatnie mecze vs średnia sezonu: **{arrow}**.")
+        else:
+            st.caption("Brak danych meczowych do wykresu formy dla tego zawodnika.")
 
     st.divider()
 
-    # ── KONTEKST KATEGORII (A1/A2…) ──
     st.markdown("#### Kategoria wiekowa")
     native = PZPN_CAT.get(int(year), "—")
-    played_cats = ", ".join(r.get("kategorie") or []) or "—"
+    cats = r.get("kategorie")
+    if isinstance(cats, list):
+        cats = ", ".join(cats)
+    elif isinstance(cats, str):
+        cats = cats.replace("; ", ", ")
+    else:
+        cats = "—"
     st.write(f"Kategoria macierzysta rocznika {int(year)} (PZPN 25/26): **{native}**.  \n"
-             f"Rozgrywki, w których grał w tym sezonie: {played_cats}.")
+             f"Rozgrywki, w których grał w tym sezonie: {cats}.")
     if bool(r.get("gra_ze_starszymi")):
         st.success(f"Gra w kategorii starszej o **{int(r['roczniki_w_gore'])}** rocznik(i) — "
                    f"historycznie silny sygnał talentu (choć bywa też skutkiem braków kadrowych).")
 
     st.divider()
 
-    # ── TOP 10 ROCZNIKA ──
     st.markdown(f"#### Top 10 rocznika {int(year)} w Polsce")
-    top10 = (df[df["eligible"]].sort_values("pm_score", ascending=False).head(10)
-             [["rank_nat", "zawodnik", "club_name", "region_name", "pm_score", "mecze", "min_total"]]
-             .copy())
-    if int(r.get("rank_nat") or 0) > 10 and r["eligible"]:
-        top10 = pd.concat([top10, df[df["player_id"] == pid]
-                          [["rank_nat", "zawodnik", "club_name", "region_name", "pm_score", "mecze", "min_total"]]])
+    cols = ["rank_nat", "zawodnik", "club_name", "region_name", "pm_score", "mecze", "min_total"]
+    top10 = df[df["eligible"]].sort_values("pm_score", ascending=False).head(10)[cols].copy()
+    if r["eligible"] and int(r.get("rank_nat") or 0) > 10:
+        top10 = pd.concat([top10, df[df["player_id"] == pid][cols]])
     top10.columns = ["#", "Zawodnik", "Klub", "Województwo", "PM Score", "Mecze", "Minuty"]
-    top10["#"] = top10["#"].astype(int)
+    top10["#"] = pd.to_numeric(top10["#"], errors="coerce").astype("Int64")
     top10["PM Score"] = top10["PM Score"].round(3)
 
     def _hl(row):
@@ -370,13 +414,12 @@ def main():
 
     with st.expander("Jak liczymy PM Score i ten ranking?"):
         st.markdown(
-            "**PM Score** to ocena meczowa PlayMaker w skali ~0–1, uwzględniająca **poziom rozgrywek** "
+            "**PM Score** to ocena meczowa PlayMaker (~0–1) uwzględniająca **poziom rozgrywek** "
             "(ta sama gra w mocniejszej lidze jest warta więcej) oraz **grę powyżej swojego rocznika**. "
             "Sezonowy wynik to średnia meczów ważona minutami.\n\n"
             "**Ranking krajowy** porównuje zawodnika z całym jego rocznikiem w Polsce — bo wynik jest już "
             "skorygowany o poziom ligi, porównanie między różnymi ligami/województwami jest uczciwe.\n\n"
-            f"Do rankingu wchodzą zawodnicy z min. **{min_min} minut** w sezonie (mniejsza próba = brak "
-            "wiarygodnego percentyla)."
+            f"Do rankingu wchodzą zawodnicy z min. **{min_min} minut** w sezonie."
         )
 
 

@@ -24,7 +24,15 @@ from app import compute_pm_score, _coerce, _cat_maxyear_series
 SRC = sys.argv[1] if len(sys.argv) > 1 else "kohorta.csv"
 
 print(f"Wczytuję {SRC} ...")
-m = _coerce(pd.read_csv(SRC, encoding="utf-8", low_memory=False))
+def _read_any(path):
+    for enc in ("utf-8-sig", "cp1250", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, low_memory=False)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise SystemExit("Nie udało się odczytać CSV (kodowanie).")
+
+m = _coerce(_read_any(SRC))
 print(f"  {len(m)} wierszy meczowych, {m['player_id'].nunique()} zawodników")
 
 m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()

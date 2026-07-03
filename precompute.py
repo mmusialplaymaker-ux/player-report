@@ -122,7 +122,10 @@ out = out.reset_index()
 out.to_csv("kohorta_agg.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
 
 trend = pd.DataFrame({"player_id": m["player_id"], "match_date": m["match_date"],
-                      "minutes": mn, "_sc": m["_sc"]})
+                      "league_name": m["league_name"], "minutes": mn,
+                      "goals": m["goals"], "yellow_cards": m["yellow_cards"],
+                      "red_cards": m["red_cards"], "match_result": m["match_result"],
+                      "team_side": m["team_side"], "_sc": m["_sc"]})
 trend = trend[trend["minutes"] > 0]
 trend.to_csv("kohorta_trend.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
 

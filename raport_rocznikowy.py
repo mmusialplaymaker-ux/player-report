@@ -89,7 +89,9 @@ def load_trend(path):
         return pd.DataFrame(columns=["player_id", "match_date", "minutes", "_sc"])
     df = _read_csv(path)
     df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
-    df["_sc"] = pd.to_numeric(df["_sc"], errors="coerce")
+    for c in ("minutes", "goals", "yellow_cards", "red_cards", "_sc"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
@@ -277,12 +279,14 @@ def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
     axd.text(0, -0.30, "PM Score", ha="center", va="center", fontsize=11, color=GREY)
     axd.set(aspect="equal")
 
-    # ── rankingi (liczby) — jednakowy rozmiar, pogrubiony tylko licznik ──
+    # ── rankingi (liczby) — jednakowy rozmiar, pogrubiony tylko licznik, bez nakładania ──
     if elig:
         fig.text(0.42, 0.820, f"Ranking rocznika {int(year)}", fontsize=11, color=GREY)
-        line = f"{int(r['rank_nat'])}.  /  {int(r['cohort_n'])} w Polsce"
-        fig.text(0.42, 0.775, line, fontsize=17, color=INK)                       # cała linia (rezerwuje szerokość)
-        fig.text(0.42, 0.775, f"{int(r['rank_nat'])}.", fontsize=17, color=INK, weight="bold")  # pogrubiony licznik
+        t_rank = fig.text(0.42, 0.775, f"{int(r['rank_nat'])}.", fontsize=17, color=INK, weight="bold")
+        fig.canvas.draw()  # potrzebne, by zmierzyć szerokość tekstu
+        bb = t_rank.get_window_extent(renderer=fig.canvas.get_renderer())
+        x_after = fig.transFigure.inverted().transform((bb.x1, 0))[0]
+        fig.text(x_after + 0.010, 0.775, f"/  {int(r['cohort_n'])} w Polsce", fontsize=17, color=INK)
         top = (1 - float(r["pctl"])) * 100
         fig.text(0.42, 0.725, f"TOP {top:.0f}% rocznika w kraju", fontsize=14, weight="bold", color=RED)
     else:
@@ -350,11 +354,11 @@ def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
         fig.text(0.15, y0 - i * 0.0195, str(name), fontsize=10, color=col, weight=w)
         fig.text(0.61, y0 - i * 0.0195, f"{float(sc) * 100:.0f}", fontsize=10, color=col, weight=w)
 
-    # ── jak podnieść PM Score ──
-    fig.text(0.07, 0.075, "Jak rosnąć w rankingu:", fontsize=10.5, weight="bold", color=INK)
-    tips = ("więcej minut  ·  mocniejsze rozgrywki (okręgówka/wojewódzka > klasa A/B/C, CLJ najwyżej)  ·  "
-            "gra w starszej kategorii  ·  minuty w seniorach")
-    fig.text(0.07, 0.055, tips, fontsize=8.5, color=GREY)
+    # ── jak podnieść PM Score (dwie linie, żeby nie wyjeżdżać) ──
+    fig.text(0.07, 0.086, "Jak rosnąć w rankingu:", fontsize=10.5, weight="bold", color=INK)
+    fig.text(0.07, 0.068, "• więcej minut   • mocniejsze rozgrywki (okręgówka/wojewódzka > klasa A/B/C, "
+             "CLJ najwyżej)", fontsize=8, color=GREY)
+    fig.text(0.07, 0.053, "• gra w starszej kategorii   • minuty w seniorach", fontsize=8, color=GREY)
 
     # ── stopka ──
     foot = (f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. "
@@ -362,11 +366,70 @@ def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
             f"Wygenerowano {_dt.date.today():%Y-%m-%d}.")
     fig.text(0.07, 0.028, foot, fontsize=7.5, color=GREY)
 
+    # ── strona 2: podsumowanie sezonu — mecze ──
+    fig2 = _pdf_match_log(r, pm_rows, year)
+
     buf = io.BytesIO()
-    fig.savefig(buf, format="pdf", bbox_inches=None)
+    from matplotlib.backends.backend_pdf import PdfPages
+    with PdfPages(buf) as pp:
+        pp.savefig(fig)
+        if fig2 is not None:
+            pp.savefig(fig2)
     plt.close(fig)
+    if fig2 is not None:
+        plt.close(fig2)
     buf.seek(0)
     return buf.getvalue()
+
+
+def _pdf_match_log(r, pm_rows, year):
+    """Strona 2 PDF: log meczów sezonu (data, rozgrywki, minuty, gole, kartki, wynik, PM)."""
+    if pm_rows is None or not len(pm_rows) or "league_name" not in pm_rows.columns:
+        return None
+    RED, INK, GREY, BG = "#e2231a", "#1b1f24", "#8a94a3", "#eef1f5"
+    g = pm_rows.sort_values("match_date").copy()
+    fig = plt.figure(figsize=(8.27, 11.69), dpi=150)
+    fig.patch.set_facecolor("white")
+    fig.text(0.07, 0.960, "PODSUMOWANIE SEZONU — MECZE", fontsize=13, weight="bold", color=INK)
+    fig.text(0.07, 0.930, f"{r.get('zawodnik') or '—'}   ·   rocznik {int(year)}", fontsize=12, color=GREY)
+
+    mn = pd.to_numeric(g["minutes"], errors="coerce").fillna(0)
+    gl = pd.to_numeric(g["goals"], errors="coerce").fillna(0)
+    yc = pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0)
+    rc = pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0)
+    sc = pd.to_numeric(g["_sc"], errors="coerce")
+    tot = (f"Mecze: {len(g)}   ·   Minuty: {int(mn.sum())}   ·   Gole: {int(gl.sum())}   ·   "
+           f"Śr. PM Score: {sc.mean() * 100:.0f}")
+    fig.text(0.07, 0.905, tot, fontsize=10.5, weight="bold", color=INK,
+             bbox=dict(boxstyle="round,pad=0.4", fc=BG, ec="none"))
+
+    # nagłówki kolumn
+    cols = [("Data", 0.07), ("Rozgrywki", 0.20), ("Min", 0.60), ("G", 0.67),
+            ("Ż", 0.72), ("Cz", 0.77), ("Wynik", 0.83), ("PM", 0.93)]
+    y = 0.860
+    for name, x in cols:
+        ha = "right" if name in ("Min", "G", "Ż", "Cz", "PM") else "left"
+        fig.text(x, y, name, fontsize=8.5, weight="bold", color=GREY, ha=ha)
+    fig.add_artist(plt.Line2D([0.07, 0.955], [y - 0.006, y - 0.006], color=BG, lw=1))
+
+    step, y = 0.0198, y - 0.024
+    maxrows = int((y - 0.05) / step)
+    rows = g.head(maxrows)
+    for _, m in rows.iterrows():
+        date = pd.to_datetime(m["match_date"]).strftime("%Y-%m-%d") if pd.notna(m["match_date"]) else "—"
+        lg = str(m.get("league_name") or "")[:34]
+        fig.text(0.07, y, date, fontsize=8, color=INK)
+        fig.text(0.20, y, lg, fontsize=8, color=INK)
+        fig.text(0.60, y, f"{int(m['minutes'])}", fontsize=8, color=INK, ha="right")
+        fig.text(0.67, y, f"{int(m['goals'])}", fontsize=8, color=INK, ha="right")
+        fig.text(0.72, y, f"{int(m.get('yellow_cards') or 0)}", fontsize=8, color=INK, ha="right")
+        fig.text(0.77, y, f"{int(m.get('red_cards') or 0)}", fontsize=8, color=INK, ha="right")
+        fig.text(0.79, y, str(m.get("match_result") or ""), fontsize=8, color=GREY)
+        fig.text(0.93, y, f"{float(m['_sc']) * 100:.0f}", fontsize=8, color=INK, ha="right", weight="bold")
+        y -= step
+    if len(g) > maxrows:
+        fig.text(0.07, y, f"… oraz {len(g) - maxrows} kolejnych meczów", fontsize=8, color=GREY, style="italic")
+    return fig
 
 
 def check_password():
@@ -509,6 +572,34 @@ def main():
                 st.caption(f"Ostatnie mecze vs średnia sezonu: **{arrow}**.")
         else:
             st.caption("Brak danych meczowych do wykresu formy dla tego zawodnika.")
+
+    st.divider()
+
+    st.markdown("#### Podsumowanie sezonu — mecze")
+    if len(pm_rows) and "league_name" in pm_rows.columns:
+        g = pm_rows.sort_values("match_date").copy()
+        mn = pd.to_numeric(g["minutes"], errors="coerce").fillna(0)
+        gl = pd.to_numeric(g["goals"], errors="coerce").fillna(0)
+        sc = pd.to_numeric(g["_sc"], errors="coerce")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Mecze", int(len(g)))
+        m2.metric("Minuty", int(mn.sum()))
+        m3.metric("Gole", int(gl.sum()))
+        m4.metric("Śr. PM Score", f"{sc.mean() * 100:.0f}")
+        log = pd.DataFrame({
+            "Data": pd.to_datetime(g["match_date"]).dt.strftime("%Y-%m-%d"),
+            "Rozgrywki": g["league_name"],
+            "Min": mn.astype(int),
+            "Gole": gl.astype(int),
+            "Żółte": pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0).astype(int),
+            "Czerw.": pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0).astype(int),
+            "Wynik": g.get("match_result"),
+            "Strona": g.get("team_side"),
+            "PM Score": (sc * 100).round(0).astype("Int64"),
+        })
+        st.dataframe(log, hide_index=True, use_container_width=True)
+    else:
+        st.caption("Brak danych meczowych dla tego zawodnika.")
 
     st.divider()
 

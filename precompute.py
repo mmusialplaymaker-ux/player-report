@@ -42,10 +42,20 @@ def _is_female(firstname):
 def _read_any(path):
     for enc in ("cp1250", "utf-8-sig", "latin-1"):
         try:
-            return pd.read_csv(path, encoding=enc, low_memory=False, sep=None, engine="python")
+            return pd.read_csv(path, encoding=enc, low_memory=False)
         except (UnicodeDecodeError, UnicodeError):
             continue
     raise SystemExit("Nie udało się odczytać CSV (kodowanie).")
+
+
+def _read_map(path):
+    # mapa nazw: nieznany separator (,/;/tab) → engine='python', bez low_memory
+    for enc in ("cp1250", "utf-8-sig", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, sep=None, engine="python")
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise SystemExit("Nie udało się odczytać mapy nazw (kodowanie).")
 
 
 # ── mapa nazw team/klub (teamy_kluby_25_26): jeśli id występuje tu, bierz nazwę stąd ──
@@ -62,7 +72,7 @@ def _load_name_maps():
         print("  (mapa nazw teamy_kluby_25_26 nie znaleziona — nazwy prosto z bazy)")
         return {}, {}
     try:
-        mp = pd.read_excel(path) if path.endswith("xlsx") else _read_any(path)
+        mp = pd.read_excel(path) if path.endswith("xlsx") else _read_map(path)
     except Exception as e:
         print(f"  (nie udało się wczytać mapy nazw: {e})")
         return {}, {}

@@ -42,15 +42,60 @@ def _is_female(firstname):
 def _read_any(path):
     for enc in ("cp1250", "utf-8-sig", "latin-1"):
         try:
-            return pd.read_csv(path, encoding=enc, low_memory=False)
+            return pd.read_csv(path, encoding=enc, low_memory=False, sep=None, engine="python")
         except (UnicodeDecodeError, UnicodeError):
             continue
     raise SystemExit("Nie udało się odczytać CSV (kodowanie).")
 
 
+# ── mapa nazw team/klub (teamy_kluby_25_26): jeśli id występuje tu, bierz nazwę stąd ──
+TEAM_MAP_FILE = "teamy_kluby_25_26.csv"
+
+
+def _load_name_maps():
+    """Zwraca (team_id->name, club_id->name). Auto-wykrywa kolumny; pusto gdy brak pliku."""
+    for cand in (TEAM_MAP_FILE, "teamy_kluby_25_26", "teamy_kluby_25_26.xlsx"):
+        if os.path.exists(cand):
+            path = cand
+            break
+    else:
+        print("  (mapa nazw teamy_kluby_25_26 nie znaleziona — nazwy prosto z bazy)")
+        return {}, {}
+    try:
+        mp = pd.read_excel(path) if path.endswith("xlsx") else _read_any(path)
+    except Exception as e:
+        print(f"  (nie udało się wczytać mapy nazw: {e})")
+        return {}, {}
+    cols = {c.lower().strip(): c for c in mp.columns}
+
+    def pick(id_kw, name_kws):
+        idc = next((cols[k] for k in cols if id_kw in k and "id" in k), None)
+        namec = next((cols[k] for k in cols for nk in name_kws if nk in k and "id" not in k), None)
+        return idc, namec
+
+    ti, tn = pick("team", ["team", "nazwa", "name"])
+    ci, cn = pick("club", ["club", "klub", "nazwa", "name"])
+    tmap = dict(zip(mp[ti].astype(str), mp[tn].astype(str))) if ti and tn else {}
+    cmap = dict(zip(mp[ci].astype(str), mp[cn].astype(str))) if ci and cn else {}
+    print(f"  mapa nazw: plik={path} | team({ti}->{tn}): {len(tmap)} | club({ci}->{cn}): {len(cmap)}")
+    if not tmap and not cmap:
+        print("    UWAGA: nie wykryto kolumn id/nazwa — nazwy zostają z bazy. "
+              "Podaj nazwy kolumn, dostroję wykrywanie.")
+    return tmap, cmap
+
+
+def _resolve(series_id, series_name, id2name):
+    """Jeśli id jest w mapie → nazwa z mapy; w przeciwnym razie surowa nazwa z bazy."""
+    if not id2name:
+        return series_name
+    mapped = series_id.astype(str).map(id2name)
+    return mapped.fillna(series_name)
+
+
 print(f"Wczytuję {SRC} ...")
 m = _coerce(_read_any(SRC))
 n0 = m["player_id"].nunique()
+TEAM_MAP, CLUB_MAP = _load_name_maps()
 
 # ── odrzuć dziewczynki (na poziomie zawodnika) ────────────────────────────────
 fem_mask = m["firstname"].map(_is_female)
@@ -64,6 +109,17 @@ if removed_names:
           + (" ..." if len(removed_names) > 25 else ""))
 
 m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()
+
+# ── rozwiąż nazwy: klub/team zawodnika + przeciwnik (mapa > baza) ──
+if "club_id" in m.columns:
+    m["club_name"] = _resolve(m["club_id"], m["club_name"], CLUB_MAP)
+if "team_id" in m.columns:
+    m["team_name"] = _resolve(m["team_id"], m["team_name"], TEAM_MAP)
+if "opponent_id" in m.columns:
+    m["opponent_name"] = _resolve(m["opponent_id"], m.get("opponent_name"), TEAM_MAP)
+elif "opponent_name" not in m.columns:
+    m["opponent_name"] = np.nan   # brak w eksporcie → dodasz po re-eksporcie SQL
+
 comp = compute_pm_score(m)
 m["_sc"] = comp["score"].values
 m["_sp"] = comp["stats_part"].values
@@ -122,7 +178,10 @@ out = out.reset_index()
 out.to_csv("kohorta_agg.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")
 
 trend = pd.DataFrame({"player_id": m["player_id"], "match_date": m["match_date"],
-                      "league_name": m["league_name"], "minutes": mn,
+                      "league_name": m["league_name"],
+                      "play_name": m.get("play_name"),
+                      "opponent_name": m.get("opponent_name"),
+                      "minutes": mn,
                       "goals": m["goals"], "yellow_cards": m["yellow_cards"],
                       "red_cards": m["red_cards"], "match_result": m["match_result"],
                       "team_side": m["team_side"], "_sc": m["_sc"]})

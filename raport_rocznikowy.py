@@ -383,52 +383,70 @@ def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
 
 
 def _pdf_match_log(r, pm_rows, year):
-    """Strona 2 PDF: log meczów sezonu (data, rozgrywki, minuty, gole, kartki, wynik, PM)."""
-    if pm_rows is None or not len(pm_rows) or "league_name" not in pm_rows.columns:
+    """Strona 2 PDF: log meczów sezonu (data, rozgrywki, przeciwnik, minuty, gole, kartki, wynik, PM)."""
+    if pm_rows is None or not len(pm_rows) or "_sc" not in pm_rows.columns:
         return None
     RED, INK, GREY, BG = "#e2231a", "#1b1f24", "#8a94a3", "#eef1f5"
+    RESMAP = {"wygrana": "W", "remis": "R", "porażka": "P"}
     g = pm_rows.sort_values("match_date").copy()
     fig = plt.figure(figsize=(8.27, 11.69), dpi=150)
     fig.patch.set_facecolor("white")
     fig.text(0.07, 0.960, "PODSUMOWANIE SEZONU — MECZE", fontsize=13, weight="bold", color=INK)
-    fig.text(0.07, 0.930, f"{r.get('zawodnik') or '—'}   ·   rocznik {int(year)}", fontsize=12, color=GREY)
+    fig.text(0.07, 0.933, f"{r.get('zawodnik') or '—'}   ·   rocznik {int(year)}", fontsize=12, color=GREY)
 
     mn = pd.to_numeric(g["minutes"], errors="coerce").fillna(0)
     gl = pd.to_numeric(g["goals"], errors="coerce").fillna(0)
     yc = pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0)
     rc = pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0)
     sc = pd.to_numeric(g["_sc"], errors="coerce")
+    minsum = max(1.0, mn.sum())
+    res = g.get("match_result").astype(str) if "match_result" in g.columns else pd.Series([], dtype=str)
     tot = (f"Mecze: {len(g)}   ·   Minuty: {int(mn.sum())}   ·   Gole: {int(gl.sum())}   ·   "
            f"Śr. PM Score: {sc.mean() * 100:.0f}")
-    fig.text(0.07, 0.905, tot, fontsize=10.5, weight="bold", color=INK,
+    fig.text(0.07, 0.908, tot, fontsize=10.5, weight="bold", color=INK,
              bbox=dict(boxstyle="round,pad=0.4", fc=BG, ec="none"))
+    ana = (f"Gole/90: {gl.sum() / minsum * 90:.2f}    Kartki/90: {(yc.sum() + rc.sum()) / minsum * 90:.2f}"
+           f"    Min/mecz: {mn.mean():.0f}")
+    if len(res):
+        ana += f"    Zwycięstwa: {(res == 'wygrana').mean() * 100:.0f}%"
+    fig.text(0.07, 0.882, ana, fontsize=9.5, color=GREY)
 
-    # nagłówki kolumn
-    cols = [("Data", 0.07), ("Rozgrywki", 0.20), ("Min", 0.60), ("G", 0.67),
-            ("Ż", 0.72), ("Cz", 0.77), ("Wynik", 0.83), ("PM", 0.93)]
-    y = 0.860
-    for name, x in cols:
-        ha = "right" if name in ("Min", "G", "Ż", "Cz", "PM") else "left"
+    # rozgrywki = play_name, fallback league_name
+    rozg = g.get("play_name")
+    if rozg is None or rozg.isna().all():
+        rozg = g.get("league_name")
+
+    # nagłówki kolumn (x, ha)
+    C = {"Data": (0.07, "left"), "Rozgrywki": (0.155, "left"), "Przeciwnik": (0.375, "left"),
+         "Min": (0.685, "right"), "G": (0.735, "right"), "K": (0.785, "right"),
+         "W": (0.825, "left"), "PM": (0.950, "right")}
+    y = 0.848
+    for name, (x, ha) in C.items():
         fig.text(x, y, name, fontsize=8.5, weight="bold", color=GREY, ha=ha)
     fig.add_artist(plt.Line2D([0.07, 0.955], [y - 0.006, y - 0.006], color=BG, lw=1))
 
-    step, y = 0.0198, y - 0.024
-    maxrows = int((y - 0.05) / step)
-    rows = g.head(maxrows)
-    for _, m in rows.iterrows():
-        date = pd.to_datetime(m["match_date"]).strftime("%Y-%m-%d") if pd.notna(m["match_date"]) else "—"
-        lg = str(m.get("league_name") or "")[:34]
-        fig.text(0.07, y, date, fontsize=8, color=INK)
-        fig.text(0.20, y, lg, fontsize=8, color=INK)
-        fig.text(0.60, y, f"{int(m['minutes'])}", fontsize=8, color=INK, ha="right")
-        fig.text(0.67, y, f"{int(m['goals'])}", fontsize=8, color=INK, ha="right")
-        fig.text(0.72, y, f"{int(m.get('yellow_cards') or 0)}", fontsize=8, color=INK, ha="right")
-        fig.text(0.77, y, f"{int(m.get('red_cards') or 0)}", fontsize=8, color=INK, ha="right")
-        fig.text(0.79, y, str(m.get("match_result") or ""), fontsize=8, color=GREY)
-        fig.text(0.93, y, f"{float(m['_sc']) * 100:.0f}", fontsize=8, color=INK, ha="right", weight="bold")
-        y -= step
+    step, y = 0.0196, y - 0.024
+    maxrows = int((y - 0.045) / step)
+    idx = g.index[:maxrows]
+    for k, i in enumerate(idx):
+        yy = y - k * step
+        date = pd.to_datetime(g.at[i, "match_date"]).strftime("%Y-%m-%d") if pd.notna(g.at[i, "match_date"]) else "—"
+        rz = str(rozg.loc[i] if rozg is not None else "")[:22]
+        opp = str(g.at[i, "opponent_name"])[:26] if "opponent_name" in g.columns and pd.notna(g.at[i, "opponent_name"]) else "—"
+        fig.text(0.07, yy, date, fontsize=7.6, color=INK)
+        fig.text(0.155, yy, rz, fontsize=7.6, color=INK)
+        fig.text(0.375, yy, opp, fontsize=7.6, color=INK)
+        fig.text(0.685, yy, f"{int(mn.loc[i])}", fontsize=7.6, color=INK, ha="right")
+        fig.text(0.735, yy, f"{int(gl.loc[i])}", fontsize=7.6, color=INK, ha="right")
+        fig.text(0.785, yy, f"{int(yc.loc[i] + rc.loc[i])}", fontsize=7.6, color=INK, ha="right")
+        fig.text(0.825, yy, RESMAP.get(str(g.at[i, "match_result"]) if "match_result" in g.columns else "", ""),
+                 fontsize=7.6, color=GREY)
+        fig.text(0.950, yy, f"{float(sc.loc[i]) * 100:.0f}", fontsize=7.6, color=INK, ha="right", weight="bold")
     if len(g) > maxrows:
-        fig.text(0.07, y, f"… oraz {len(g) - maxrows} kolejnych meczów", fontsize=8, color=GREY, style="italic")
+        fig.text(0.07, y - maxrows * step, f"… oraz {len(g) - maxrows} kolejnych meczów",
+                 fontsize=8, color=GREY, style="italic")
+    fig.text(0.07, 0.028, "W = wygrana · R = remis · P = porażka · K = kartki (żółte+czerwone)",
+             fontsize=7.5, color=GREY)
     return fig
 
 
@@ -576,23 +594,40 @@ def main():
     st.divider()
 
     st.markdown("#### Podsumowanie sezonu — mecze")
-    if len(pm_rows) and "league_name" in pm_rows.columns:
+    if len(pm_rows) and "_sc" in pm_rows.columns:
         g = pm_rows.sort_values("match_date").copy()
         mn = pd.to_numeric(g["minutes"], errors="coerce").fillna(0)
         gl = pd.to_numeric(g["goals"], errors="coerce").fillna(0)
+        yc = pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0)
+        rc = pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0)
         sc = pd.to_numeric(g["_sc"], errors="coerce")
+        minsum = max(1.0, mn.sum())
+        res = g.get("match_result").astype(str) if "match_result" in g.columns else pd.Series([], dtype=str)
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Mecze", int(len(g)))
         m2.metric("Minuty", int(mn.sum()))
         m3.metric("Gole", int(gl.sum()))
         m4.metric("Śr. PM Score", f"{sc.mean() * 100:.0f}")
+        # wiersz analityki (per 90 / średnie)
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Gole / 90", f"{gl.sum() / minsum * 90:.2f}")
+        a2.metric("Kartki / 90", f"{(yc.sum() + rc.sum()) / minsum * 90:.2f}")
+        a3.metric("Minuty / mecz", f"{mn.mean():.0f}")
+        if len(res):
+            a4.metric("Zwycięstwa", f"{(res == 'wygrana').mean() * 100:.0f}%")
+
+        rozgrywki = g.get("play_name")
+        if rozgrywki is None or rozgrywki.isna().all():
+            rozgrywki = g["league_name"]
         log = pd.DataFrame({
             "Data": pd.to_datetime(g["match_date"]).dt.strftime("%Y-%m-%d"),
-            "Rozgrywki": g["league_name"],
+            "Rozgrywki": rozgrywki,
+            "Przeciwnik": g.get("opponent_name"),
             "Min": mn.astype(int),
             "Gole": gl.astype(int),
-            "Żółte": pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0).astype(int),
-            "Czerw.": pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0).astype(int),
+            "Żółte": yc.astype(int),
+            "Czerw.": rc.astype(int),
             "Wynik": g.get("match_result"),
             "Strona": g.get("team_side"),
             "PM Score": (sc * 100).round(0).astype("Int64"),

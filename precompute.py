@@ -17,6 +17,7 @@ Uruchomienie:
 """
 import os
 import sys
+import re
 import numpy as np
 import pandas as pd
 
@@ -102,6 +103,37 @@ def _resolve(series_id, series_name, id2name):
     return mapped.fillna(series_name)
 
 
+# ── SZCZEBEL rozgrywek juniorskich (drabina awansu), z play_name ──────────────
+#   5 = CLJ / Liga Makroregionalna   4 = I liga wojewódzka   3 = II liga wojewódzka
+#   2 = III liga wojewódzka          1 = liga okręgowa       0 = nierozpoznany
+SZCZEBEL_NAZWA = {5: "CLJ / Makroregionalna", 4: "I liga wojewódzka",
+                  3: "II liga wojewódzka", 2: "III liga wojewódzka",
+                  1: "liga okręgowa", 0: "—"}
+_ROMAN = {"i": 1, "ii": 2, "iii": 3}
+_WOJ = ("małopolsk", "śląsk", "świętokrzysk", "dolnośląsk", "wielkopolsk", "pomorsk", "mazowieck",
+        "lubelsk", "podkarpack", "kujawsko", "warmińsko", "zachodniopomorsk", "lubusk", "łódzk",
+        "opolsk", "podlask")
+
+
+def _szczebel(play_name, league_name):
+    s = f"{play_name} {league_name}".lower()
+    if "clj" in s or "centralna liga" in s or "makroregion" in s:
+        return 5
+    mm = re.search(r"\b(i{1,3})\s+liga\s+(wojew|okr)", s)
+    if mm:
+        n, typ = _ROMAN[mm.group(1)], mm.group(2)
+        if typ == "wojew":
+            return {1: 4, 2: 3, 3: 2}[n]
+        return 1                       # każda okręgowa = najniższy szczebel drabiny
+    if "okręgow" in s or "okregow" in s:
+        return 1
+    if re.match(r"^[a-ząćęłńóśźż\- ]+:", s):        # prefiks miasta „Kraków:” → podokręg
+        return 1
+    if any(w in s for w in _WOJ) or re.search(r"\bwlj\b|wojewódzk", s):
+        return 4
+    return 0                                        # nierozpoznany → bez wskazówki o awansie
+
+
 print(f"Wczytuję {SRC} ...")
 m = _coerce(_read_any(SRC))
 n0 = m["player_id"].nunique()
@@ -183,6 +215,18 @@ out["clj_minutes"] = (mn * is_clj).groupby(m["player_id"]).sum()
 is_senior = (~m["is_junior_comp"].fillna(False)) & (m["age_at_match"].between(12, 19))
 out["senior_minutes"] = (mn * is_senior).groupby(m["player_id"]).sum()
 out["kategorie"] = gp["league_name"].agg(lambda s: "; ".join(sorted(set(s.dropna().astype(str)))))
+
+# ── szczebel dominujący (ważony minutami) + kategoria dominująca ──
+m["_szcz"] = [_szczebel(p, l) for p, l in zip(m.get("play_name", pd.Series(index=m.index, dtype=object)).fillna(""),
+                                              m["league_name"].fillna(""))]
+_sz = (m[m["_szcz"] > 0].assign(_w=mn[m["_szcz"] > 0])
+       .groupby(["player_id", "_szcz"])["_w"].sum().reset_index()
+       .sort_values("_w", ascending=False).groupby("player_id").first())
+out["szczebel"] = _sz["_szcz"].reindex(out.index).fillna(0).astype(int)
+out["szczebel_nazwa"] = out["szczebel"].map(SZCZEBEL_NAZWA)
+_kat = (m.assign(_w=mn).groupby(["player_id", "league_name"])["_w"].sum().reset_index()
+        .sort_values("_w", ascending=False).groupby("player_id").first())
+out["kategoria_glowna"] = _kat["league_name"].reindex(out.index)
 
 out = out.reset_index()
 out.to_csv("kohorta_agg.csv.gz", index=False, encoding="utf-8-sig", compression="gzip")

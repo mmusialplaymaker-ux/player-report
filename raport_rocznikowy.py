@@ -50,7 +50,7 @@ DIMS = ["Jakość gry", "Skuteczność", "Regularność gry", "Równość formy"
 
 _AGG_NUMS = ["est_birth_year", "min_total", "mecze", "gole", "kartki", "pm_score", "pm_quality",
              "gole_per90", "kartki_per90", "forma", "kons", "roczniki_w_gore",
-             "clj_minutes", "senior_minutes"]
+             "clj_minutes", "senior_minutes", "szczebel"]
 
 st.set_page_config(page_title="Raport rocznikowy · PlayMaker", layout="wide")
 
@@ -186,7 +186,92 @@ def apply_percentiles(base, min_min):
     for lbl, col in src.items():
         df.loc[elig, lbl] = sub[col].rank(pct=True)
     df.loc[elig, "Dyscyplina"] = (-sub["kartki_per90"]).rank(pct=True)
+    # percentyl w obrębie własnego szczebla (do wskazówek „czy przerastasz poziom”)
+    if "szczebel" in df.columns:
+        for sz, idx in df[elig & (df["szczebel"] > 0)].groupby("szczebel").groups.items():
+            if len(idx) >= 20:                       # za mała grupa → brak wiarygodnego percentyla
+                df.loc[idx, "pctl_lvl"] = df.loc[idx, "pm_score"].rank(pct=True)
     return df
+
+
+# ── SILNIK WSKAZÓWEK ─────────────────────────────────────────────────────────
+NASTEPNY_SZCZEBEL = {1: "II liga wojewódzka", 2: "II liga wojewódzka",
+                     3: "I liga wojewódzka", 4: "CLJ (Centralna Liga Juniorów)"}
+
+
+def rekomendacja(r, min_min):
+    """(nagłówek, [kroki]) — konkretny następny krok na podstawie wyniku, szczebla i minut."""
+    pctl = r.get("pctl")
+    lvl = r.get("pctl_lvl")
+    sz = int(r.get("szczebel") or 0)
+    mins = float(r.get("min_total") or 0)
+    sen = float(r.get("senior_minutes") or 0)
+    clj = float(r.get("clj_minutes") or 0)
+    kat = str(r.get("kategoria_glowna") or "")
+    starszy = bool(r.get("gra_ze_starszymi"))
+
+    # 1) za mało gry — najpierw minuty, dopiero potem myślenie o zmianie klubu
+    if mins < min_min:
+        return ("Priorytet: regularna gra", [
+            f"Masz {int(mins)} min w sezonie — poniżej progu {min_min} min, od którego oceniamy w skali kraju.",
+            "Zanim myślisz o zmianie klubu, powalcz o miejsce w składzie tam, gdzie jesteś.",
+            "Regularność sama w sobie podnosi PM Score.",
+        ])
+
+    # 2) przerastasz swój szczebel → konkretny awans
+    if sz and pd.notna(lvl) and lvl >= 0.85 and sz < 5:
+        cel = NASTEPNY_SZCZEBEL.get(sz, "wyższy szczebel")
+        return (f"Twój poziom jest dla Ciebie za łatwy — celuj w {cel}", [
+            f"Jesteś w czołowych {(1 - lvl) * 100:.0f}% zawodników swojego szczebla "
+            f"({r.get('szczebel_nazwa') or '—'}).",
+            f"Konkretny krok: testy w klubie grającym w {cel}.",
+            "Jeśli nie grasz w starszym roczniku — poproś trenera o próbę." if not starszy
+            else "Grasz już w starszej kategorii — trzymaj tak dalej.",
+        ])
+
+    # 3) klasa krajowa bez minut w seniorach → seniorzy
+    if pd.notna(pctl) and pctl >= 0.90 and sen == 0 and kat in ("A1", "A2", "B1"):
+        return ("Czas na pierwsze minuty w seniorach", [
+            f"Jesteś w czołowych {(1 - pctl) * 100:.0f}% rocznika w Polsce.",
+            "Poproś trenera o powołanie do kadry seniorów — nawet kilka meczów robi różnicę.",
+            "Jeśli grasz poniżej CLJ, rozważ testy w akademii z CLJ." if clj == 0 else
+            "Masz już minuty w CLJ — utrzymaj poziom i zbieraj minuty.",
+        ])
+
+    # 4) mocny, ale jeszcze nie dominuje szczebla
+    if pd.notna(lvl) and lvl >= 0.60:
+        return ("Jesteś blisko — dołóż minut i stabilności", [
+            f"W swoim szczeblu ({r.get('szczebel_nazwa') or '—'}) wyprzedzasz "
+            f"{lvl * 100:.0f}% zawodników.",
+            "Celuj w pełne 90 minut i równą formę mecz po meczu.",
+            "Spróbuj gry w starszym roczniku — to najszybszy sposób na wzrost PM Score." if not starszy
+            else "Utrzymaj grę w starszej kategorii.",
+        ])
+
+    # 5) mocny w skali kraju, ale bez wiarygodnych danych o szczeblu
+    if pd.notna(pctl) and pctl >= 0.75:
+        return ("Mocny wynik w skali kraju — czas celować wyżej", [
+            f"Wyprzedzasz {pctl * 100:.0f}% rocznika w Polsce.",
+            "Rozważ testy w klubie z wyższego szczebla (wojewódzki, docelowo CLJ)."
+            if sz == 0 else f"Rozważ testy o szczebel wyżej niż {r.get('szczebel_nazwa') or '—'}.",
+            "Poproś o minuty w starszym roczniku lub w seniorach." if sen == 0 else
+            "Masz już minuty w seniorach — zbieraj ich więcej.",
+        ])
+
+    # 6) niżej w stawce — uczciwie: fundamenty, nie testy
+    return ("Fundamenty: minuty, regularność, forma", [
+        "Na tym etapie zmiana klubu na mocniejszy raczej nie pomoże — najpierw zbuduj przewagę tam, gdzie grasz.",
+        "Cel na najbliższe tygodnie: więcej minut i równiejsze występy (mniej słabych meczów).",
+        "PM Score rośnie też z poziomem rozgrywek — ale dopiero, gdy realnie na nim grasz.",
+    ])
+
+
+def pozycja_txt(pctl):
+    """Uczciwy opis pozycji: bez mylącego 'TOP 88%'."""
+    przed = pctl * 100
+    if przed >= 50:
+        return f"Wyprzedzasz {przed:.0f}% rocznika  ·  TOP {100 - przed:.0f}%"
+    return f"Wyprzedzasz {przed:.0f}% rocznika w Polsce"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,8 +372,7 @@ def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
         bb = t_rank.get_window_extent(renderer=fig.canvas.get_renderer())
         x_after = fig.transFigure.inverted().transform((bb.x1, 0))[0]
         fig.text(x_after + 0.010, 0.775, f"/  {int(r['cohort_n'])} w Polsce", fontsize=17, color=INK)
-        top = (1 - float(r["pctl"])) * 100
-        fig.text(0.42, 0.725, f"TOP {top:.0f}% rocznika w kraju", fontsize=14, weight="bold", color=RED)
+        fig.text(0.42, 0.725, pozycja_txt(float(r["pctl"])), fontsize=13, weight="bold", color=RED)
     else:
         fig.text(0.42, 0.80, "Za mało minut na ranking krajowy", fontsize=12, color=GREY)
         fig.text(0.42, 0.760, f"{int(r.get('min_total') or 0)} min", fontsize=20, weight="bold", color=INK)
@@ -354,11 +438,14 @@ def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
         fig.text(0.15, y0 - i * 0.0195, str(name), fontsize=10, color=col, weight=w)
         fig.text(0.61, y0 - i * 0.0195, f"{float(sc) * 100:.0f}", fontsize=10, color=col, weight=w)
 
-    # ── jak podnieść PM Score (dwie linie, żeby nie wyjeżdżać) ──
-    fig.text(0.07, 0.086, "Jak rosnąć w rankingu:", fontsize=10.5, weight="bold", color=INK)
-    fig.text(0.07, 0.068, "• więcej minut   • mocniejsze rozgrywki (okręgówka/wojewódzka > klasa A/B/C, "
-             "CLJ najwyżej)", fontsize=8, color=GREY)
-    fig.text(0.07, 0.053, "• gra w starszej kategorii   • minuty w seniorach", fontsize=8, color=GREY)
+    # ── twój następny krok (dynamiczne wskazówki) ──
+    head, steps = rekomendacja(r, min_min)
+    fig.text(0.07, 0.105, "TWÓJ NASTĘPNY KROK", fontsize=8.5, weight="bold", color=GREY)
+    fig.text(0.07, 0.086, head, fontsize=11, weight="bold", color=INK)
+    yy = 0.068
+    for stp in steps[:3]:
+        fig.text(0.07, yy, "• " + stp[:118], fontsize=7.6, color=GREY)
+        yy -= 0.0145
 
     # ── stopka ──
     foot = (f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. "
@@ -550,7 +637,7 @@ def main():
         gfig, top = fig_gauge(r["pctl"])
         c1, c2 = st.columns([1, 1.3])
         with c1:
-            st.markdown(f"#### Jesteś w **TOP {top:.0f}%** rocznika w Polsce")
+            st.markdown(f"#### {pozycja_txt(float(r['pctl']))}")
             st.metric("Miejsce w kraju (rocznik)", f"{int(r['rank_nat'])} / {int(r['cohort_n'])}")
             st.plotly_chart(gfig, use_container_width=True, config=PLOTLY_CFG)
         with c2:
@@ -635,6 +722,16 @@ def main():
         st.dataframe(log, hide_index=True, use_container_width=True)
     else:
         st.caption("Brak danych meczowych dla tego zawodnika.")
+
+    st.divider()
+
+    st.markdown("#### Twój następny krok")
+    _head, _steps = rekomendacja(r, min_min)
+    st.success(f"**{_head}**")
+    for _s in _steps:
+        st.markdown(f"- {_s}")
+    if int(r.get("szczebel") or 0) == 0:
+        st.caption("Szczebel rozgrywek nierozpoznany z nazwy ligi — wskazówka o awansie pominięta.")
 
     st.divider()
 

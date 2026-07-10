@@ -341,6 +341,28 @@ def fig_trend(pm_rows, cohort_median):
 # ─────────────────────────────────────────────────────────────────────────────
 # DOSTĘP (opcjonalne hasło — secret APP_PASSWORD)
 # ─────────────────────────────────────────────────────────────────────────────
+def wystepy_per_play(g):
+    """Agregat występów per rozgrywki (play) + kategoria. Używane w apce i w PDF."""
+    if g is None or not len(g):
+        return pd.DataFrame()
+    gg = g.copy()
+    gg["_play"] = gg.get("play_name")
+    if "_play" not in gg.columns or gg["_play"].isna().all():
+        gg["_play"] = gg.get("league_name")
+    mn = pd.to_numeric(gg["minutes"], errors="coerce").fillna(0)
+    gl = pd.to_numeric(gg["goals"], errors="coerce").fillna(0)
+    kk = (pd.to_numeric(gg.get("yellow_cards"), errors="coerce").fillna(0)
+          + pd.to_numeric(gg.get("red_cards"), errors="coerce").fillna(0))
+    gg = gg.assign(_mn=mn, _gl=gl, _kk=kk)
+    per = (gg.groupby(["_play", "league_name"], dropna=False)
+           .agg(mecze=("match_date", "count"), minuty=("_mn", "sum"), gole=("_gl", "sum"),
+                kartki=("_kk", "sum"), pm=("_sc", lambda s: pd.to_numeric(s, errors="coerce").mean()))
+           .reset_index().sort_values("minuty", ascending=False))
+    for c in ("mecze", "minuty", "gole", "kartki"):
+        per[c] = per[c].astype(int)
+    return per
+
+
 def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
     """PDF w ciemnym stylu PlayMaker: str.1 = raport, str.2 = sezon + mecze, str.3+ = reszta meczów."""
     figs = [_pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min),
@@ -572,19 +594,45 @@ def _pdf_page2(r, pm_rows, year, min_min):
             col, row = k % 4, k // 4
             _tile(fig, X + 0.022 + col * (tw + gap), 0.612 - row * 0.062, tw, 0.052, v, lab)
 
+    # ── WYSTĘPY W ROZGRYWKACH (per play) ──
+    per = wystepy_per_play(g)
+    _card(fig, X, 0.352, W, 0.172)
+    fig.text(X + 0.025, 0.500, "Występy w rozgrywkach", fontsize=11.5, color=TXT, weight="bold")
+    if len(per):
+        hdr = ((0.500, "KAT."), (0.585, "MECZE"), (0.655, "MIN"), (0.715, "GOLE"))
+        for xx, lab in hdr:
+            fig.text(X + xx, 0.478, lab, fontsize=6, color=MUTED, ha="right")
+        fig.text(X + W - 0.038, 0.478, "ŚR. PM", fontsize=6, color=MUTED, ha="right")
+        rh2, y1 = 0.0272, 0.456
+        for k, (_, p) in enumerate(per.head(4).iterrows()):
+            yy = y1 - k * rh2
+            _card(fig, X + 0.020, yy - 0.009, W - 0.040, 0.023, fc=CARD2, ec=EDGE, r=0.008)
+            nm = str(p["_play"])[:42]
+            fig.text(X + 0.036, yy + 0.0025, nm, fontsize=7.2, color=TXT, va="center", zorder=3)
+            fig.text(X + 0.500, yy + 0.0025, str(p["league_name"] or "—")[:9], fontsize=6.8,
+                     color=MUTED, ha="right", va="center", zorder=3)
+            for xx, v in ((0.585, p["mecze"]), (0.655, f"{p['minuty']}′"), (0.715, p["gole"])):
+                fig.text(X + xx, yy + 0.0025, str(v), fontsize=7.4, color=TXT, ha="right",
+                         va="center", zorder=3)
+            fig.text(X + W - 0.038, yy + 0.0025, f"{(p['pm'] or 0) * 100:.0f}", fontsize=8,
+                     color=RED, weight="bold", ha="right", va="center", zorder=3)
+        if len(per) > 4:
+            fig.text(X + 0.025, y1 - 4 * rh2 - 0.002, f"… oraz {len(per) - 4} innych rozgrywek",
+                     fontsize=7, color=MUTED, style="italic")
+
     # ── WSZYSTKIE MECZE (część 1; reszta na kolejnych stronach) ──
-    _card(fig, X, 0.045, W, 0.478)
-    fig.text(X + 0.025, 0.498, "Wszystkie mecze sezonu", fontsize=11.5, color=TXT, weight="bold")
+    _card(fig, X, 0.045, W, 0.288)
+    fig.text(X + 0.025, 0.308, "Wszystkie mecze sezonu", fontsize=11.5, color=TXT, weight="bold")
     if not len(g):
-        fig.text(X + 0.025, 0.470, "Brak danych meczowych.", fontsize=9, color=MUTED)
+        fig.text(X + 0.025, 0.280, "Brak danych meczowych.", fontsize=9, color=MUTED)
         _pdf_footer(fig, X, min_min)
         return fig
-    _match_rows(fig, X, W, g.iloc[:MATCH_ROWS_P2], y0=0.452)
+    _match_rows(fig, X, W, g.iloc[:MATCH_ROWS_P2], y0=0.262)
     _pdf_footer(fig, X, min_min)
     return fig
 
 
-MATCH_ROWS_P2 = 14      # mecze na stronie 2 (pod kaflami)
+MATCH_ROWS_P2 = 7       # mecze na stronie 2 (pod kaflami i rozgrywkami)
 MATCH_ROWS_PN = 26      # mecze na kolejnych stronach (cała strona)
 _RES = {"wygrana": ("W", GREEN), "remis": ("R", AMBER), "porażka": ("P", RED)}
 
@@ -824,6 +872,16 @@ def main():
             "PM Score": (sc * 100).round(0).astype("Int64"),
         })
         st.dataframe(log, hide_index=True, use_container_width=True)
+
+        # ── występy per rozgrywki (play) ──
+        st.markdown("##### Występy w rozgrywkach")
+        per = wystepy_per_play(g)
+        if len(per):
+            show = per.rename(columns={"_play": "Rozgrywki", "league_name": "Kategoria",
+                                       "mecze": "Mecze", "minuty": "Minuty", "gole": "Gole",
+                                       "kartki": "Kartki", "pm": "Śr. PM"})
+            show["Śr. PM"] = (show["Śr. PM"] * 100).round(0).astype("Int64")
+            st.dataframe(show, hide_index=True, use_container_width=True)
     else:
         st.caption("Brak danych meczowych dla tego zawodnika.")
 

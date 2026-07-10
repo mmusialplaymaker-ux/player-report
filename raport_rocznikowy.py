@@ -239,6 +239,20 @@ def rekomendacja(r, min_min):
             "Masz już minuty w CLJ — utrzymaj poziom i zbieraj minuty.",
         ])
 
+    # 3b) krajowa czołówka, która już gra wyżej — utrzymanie kierunku, nie „dołóż minut”
+    if pd.notna(pctl) and pctl >= 0.95 and (sen > 0 or clj > 0):
+        gdzie = []
+        if clj > 0:
+            gdzie.append(f"{int(clj)}′ w CLJ")
+        if sen > 0:
+            gdzie.append(f"{int(sen)}′ w seniorach")
+        return ("Jesteś w krajowej czołówce rocznika — utrzymaj kierunek", [
+            f"Wyprzedzasz {pctl * 100:.0f}% rocznika w Polsce ({', '.join(gdzie)}).",
+            "Priorytet: regularne minuty na najwyższym dostępnym poziomie, nie zmiana klubu.",
+            "Kolejny krok to mocniejszy zespół seniorów / kadra wojewódzka." if sen > 0
+            else "Kolejny krok to pierwsze minuty w seniorach.",
+        ])
+
     # 4) mocny, ale jeszcze nie dominuje szczebla
     if pd.notna(lvl) and lvl >= 0.60:
         return ("Jesteś blisko — dołóż minut i stabilności", [
@@ -425,13 +439,34 @@ def _chip(fig, x, y, text, fc=CARD2, tc=TXT, ec=EDGE, fs=8.5, weight="normal", p
     return x + w + 2 * pad + 0.008
 
 
+LOGO_PATH = _secret("PM_LOGO", "logo.png")   # połóż logo.png (najlepiej PNG z przezroczystością)
+
+
 def _logo(fig, x, y):
-    _card(fig, x, y - 0.012, 0.205, 0.030, fc="#FFFFFF", ec="#FFFFFF", r=0.008)
-    _card(fig, x + 0.012, y - 0.0075, 0.021, 0.021, fc=RED, ec=RED, r=0.005)
-    fig.text(x + 0.0225, y, "P", fontsize=10, color="#FFFFFF", weight="bold",
-             ha="center", va="center", zorder=4)
-    fig.text(x + 0.042, y, "PLAYMAKER", fontsize=10.5, color="#111", weight="bold", va="center", zorder=4)
-    fig.text(x + 0.163, y - 0.001, ".pro", fontsize=7, color=RED, weight="bold", va="center", zorder=4)
+    """Prawdziwe logo z pliku, a gdy go brak — rysowana wersja zastępcza."""
+    if os.path.exists(LOGO_PATH):
+        try:
+            import matplotlib.image as mpimg
+            img = mpimg.imread(LOGO_PATH)
+            h_img, w_img = img.shape[0], img.shape[1]
+            h = 0.030                                   # docelowa wysokość w ułamku figury
+            w = h * (w_img / h_img) * (11.69 / 8.27)    # korekta proporcji A4
+            ax = fig.add_axes([x, y - h / 2, w, h], zorder=5)
+            ax.imshow(img)
+            ax.axis("off")
+            ax.patch.set_alpha(0)
+            return
+        except Exception:
+            pass
+    # fallback: biała pigułka + czerwony kwadrat z „P” + PLAYMAKER.pro
+    _card(fig, x, y - 0.013, 0.200, 0.032, fc="#FFFFFF", ec="#FFFFFF", r=0.009)
+    _card(fig, x + 0.011, y - 0.0085, 0.023, 0.023, fc=RED, ec=RED, r=0.006)
+    fig.text(x + 0.0225, y, "P", fontsize=11, color="#FFFFFF", weight="bold",
+             ha="center", va="center", zorder=6)
+    fig.text(x + 0.042, y, "PLAYMAKER", fontsize=10.5, color="#0A0A0B", weight="bold",
+             va="center", zorder=6)
+    fig.text(x + 0.160, y - 0.0015, ".pro", fontsize=6.5, color=RED, weight="bold",
+             va="center", zorder=6)
 
 
 def _tile(fig, x, y, w, h, value, label):

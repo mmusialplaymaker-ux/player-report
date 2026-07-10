@@ -413,6 +413,7 @@ RED_DIM = "#3A1416"
 AMBER   = "#F0B429"
 AMBER_D = "#3A2D12"
 GREEN   = "#22A06B"
+GREEN_D = "#12291F"
 
 
 def _dark_fig():
@@ -499,15 +500,31 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
              color=MUTED, weight="bold", ha="right", va="center")
 
     # ── HERO ──
-    _card(fig, X, 0.792, W, 0.128)
-    fig.text(X + 0.025, 0.898, "TWÓJ RAPORT", fontsize=7.5, color=RED, weight="bold")
-    fig.text(X + 0.025, 0.868, str(r.get("zawodnik") or "—"), fontsize=21, color=TXT, weight="bold")
-    cx = _chip(fig, X + 0.025, 0.827, f"Rocznik {int(year)}")
-    cx = _chip(fig, cx, 0.827, str(r.get("region_name") or "—"))
+    # chipy: rocznik, region + wyróżniki (gra ze starszymi / CLJ / seniorzy)
+    extras = []
     if bool(r.get("gra_ze_starszymi")):
         n = r.get("roczniki_w_gore")
         lbl = f"Gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "Gra ze starszymi"
-        _chip(fig, cx, 0.827, lbl, fc=RED_DIM, tc=RED, ec=RED, weight="bold")
+        extras.append((lbl, RED_DIM, RED, RED))
+    if (r.get("clj_minutes") or 0) > 0:
+        extras.append((f"{int(r['clj_minutes'])}′ w CLJ", AMBER_D, AMBER, AMBER))
+    if (r.get("senior_minutes") or 0) > 0:
+        extras.append((f"{int(r['senior_minutes'])}′ w seniorach", GREEN_D, GREEN, GREEN))
+
+    two_rows = len(extras) >= 2
+    h_hero = 0.148 if two_rows else 0.128
+    _card(fig, X, 0.920 - h_hero, W, h_hero)
+    fig.text(X + 0.025, 0.898, "TWÓJ RAPORT", fontsize=7.5, color=RED, weight="bold")
+    fig.text(X + 0.025, 0.868, str(r.get("zawodnik") or "—"), fontsize=21, color=TXT, weight="bold")
+
+    row1, row2 = 0.831, 0.800
+    cx = _chip(fig, X + 0.025, row1, f"Rocznik {int(year)}")
+    cx = _chip(fig, cx, row1, str(r.get("region_name") or "—"))
+    y_chip, xmax = row1, X + 0.470
+    for lbl, fc, tc, ec in extras:
+        if cx > xmax and y_chip == row1:          # nie mieści się → drugi rząd
+            cx, y_chip = X + 0.025, row2
+        cx = _chip(fig, cx, y_chip, lbl, fc=fc, tc=tc, ec=ec, weight="bold")
 
     _card(fig, X + 0.60, 0.828, 0.115, 0.068, fc="#FBE9EA", ec="#FBE9EA", r=0.012)
     fig.text(X + 0.6575, 0.862, f"{pm:.0f}", fontsize=26, color=RED, weight="bold",
@@ -835,13 +852,18 @@ def main():
     badges = []
     if bool(r.get("gra_ze_starszymi")):
         n = r.get("roczniki_w_gore")
-        badges.append(f"↑ gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "↑ gra ze starszymi")
-    if (r.get("senior_minutes") or 0) > 0:
-        badges.append(f"⚽ {int(r['senior_minutes'])}′ w seniorach")
+        lbl = f"⚡ Gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "⚡ Gra ze starszymi"
+        badges.append((lbl, "#E8232A"))
     if (r.get("clj_minutes") or 0) > 0:
-        badges.append(f"🏅 {int(r['clj_minutes'])}′ w CLJ")
+        badges.append((f"🏅 {int(r['clj_minutes'])}′ w CLJ", "#F0B429"))
+    if (r.get("senior_minutes") or 0) > 0:
+        badges.append((f"⚽ {int(r['senior_minutes'])}′ w seniorach", "#22A06B"))
     if badges:
-        st.markdown(" ".join(f"`{b}`" for b in badges))
+        html = " ".join(
+            f"<span style='border:1px solid {c};color:{c};border-radius:999px;"
+            f"padding:3px 10px;margin-right:6px;font-size:0.85em;white-space:nowrap;'>{t}</span>"
+            for t, c in badges)
+        st.markdown(html, unsafe_allow_html=True)
 
     st.divider()
 

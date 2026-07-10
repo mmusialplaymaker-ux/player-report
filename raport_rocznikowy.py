@@ -26,6 +26,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 import io
+import textwrap
 import datetime as _dt
 import matplotlib
 matplotlib.use("Agg")
@@ -341,201 +342,304 @@ def fig_trend(pm_rows, cohort_median):
 # DOSTĘP (opcjonalne hasło — secret APP_PASSWORD)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
-    """Jednostronicowy PDF: PM Score, ranking, rozkład rocznika, trend, Top 10, wskazówki."""
-    RED, GREEN, INK, GREY, BG = "#e2231a", "#22a06b", "#1b1f24", "#8a94a3", "#eef1f5"
-    pm = float(r.get("pm_score") or 0) * 100
-    elig = bool(r.get("eligible"))
-    fig = plt.figure(figsize=(8.27, 11.69), dpi=150)  # A4
-    fig.patch.set_facecolor("white")
-
-    # ── nagłówek ──
-    fig.text(0.07, 0.960, "RAPORT PLAYMAKER", fontsize=13, weight="bold", color=INK)
-    fig.text(0.93, 0.960, "playmaker.pro", fontsize=10, color=RED, ha="right", weight="bold")
-    fig.text(0.07, 0.925, str(r.get("zawodnik") or "—"), fontsize=22, weight="bold", color=INK)
-    meta = f"Rocznik {int(year)}   ·   {r.get('club_name') or '—'}   ·   {r.get('region_name') or '—'}"
-    fig.text(0.07, 0.900, meta, fontsize=11, color=GREY)
-    fig.add_artist(plt.Line2D([0.07, 0.93], [0.885, 0.885], color=BG, lw=2))
-
-    # ── donut PM Score ──
-    axd = fig.add_axes([0.07, 0.70, 0.26, 0.15])
-    axd.pie([pm, max(0.0, 100 - pm)], colors=[RED, BG], startangle=90,
-            counterclock=False, wedgeprops=dict(width=0.34))
-    axd.text(0, 0.08, f"{pm:.0f}", ha="center", va="center", fontsize=28, weight="bold", color=INK)
-    axd.text(0, -0.30, "PM Score", ha="center", va="center", fontsize=11, color=GREY)
-    axd.set(aspect="equal")
-
-    # ── rankingi (liczby) — jednakowy rozmiar, pogrubiony tylko licznik, bez nakładania ──
-    if elig:
-        fig.text(0.42, 0.820, f"Ranking rocznika {int(year)}", fontsize=11, color=GREY)
-        t_rank = fig.text(0.42, 0.775, f"{int(r['rank_nat'])}.", fontsize=17, color=INK, weight="bold")
-        fig.canvas.draw()  # potrzebne, by zmierzyć szerokość tekstu
-        bb = t_rank.get_window_extent(renderer=fig.canvas.get_renderer())
-        x_after = fig.transFigure.inverted().transform((bb.x1, 0))[0]
-        fig.text(x_after + 0.010, 0.775, f"/  {int(r['cohort_n'])} w Polsce", fontsize=17, color=INK)
-        fig.text(0.42, 0.725, pozycja_txt(float(r["pctl"])), fontsize=13, weight="bold", color=RED)
-    else:
-        fig.text(0.42, 0.80, "Za mało minut na ranking krajowy", fontsize=12, color=GREY)
-        fig.text(0.42, 0.760, f"{int(r.get('min_total') or 0)} min", fontsize=20, weight="bold", color=INK)
-        fig.text(0.42, 0.725, f"(próg {min_min} min)", fontsize=11, color=GREY)
-
-    # ── znaczniki ──
-    badges = []
-    if bool(r.get("gra_ze_starszymi")):
-        n = r.get("roczniki_w_gore")
-        badges.append(f"gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "gra ze starszymi")
-    if (r.get("senior_minutes") or 0) > 0:
-        badges.append(f"{int(r['senior_minutes'])}' w seniorach")
-    if (r.get("clj_minutes") or 0) > 0:
-        badges.append(f"{int(r['clj_minutes'])}' w CLJ")
-    if badges:
-        fig.text(0.07, 0.672, "  ·  ".join(badges), fontsize=10.5, color=INK,
-                 bbox=dict(boxstyle="round,pad=0.4", fc=BG, ec="none"))
-
-    # ── rozkład rocznika: gdzie jesteś ──
-    fig.text(0.07, 0.640, "Gdzie jesteś na tle rocznika", fontsize=12, weight="bold", color=INK)
-    axh = fig.add_axes([0.07, 0.505, 0.86, 0.115])
-    if dist_scores is not None and len(dist_scores):
-        axh.hist(np.asarray(dist_scores, dtype=float) * 100, bins=40, color="#c9d2dc")
-        if elig:
-            axh.axvline(pm, color=RED, lw=2.4)
-            axh.text(pm, axh.get_ylim()[1] * 0.92, " tu jesteś", color=RED, fontsize=9, weight="bold")
-    axh.set_xlabel("PM Score", fontsize=8, color=GREY)
-    for s in ("top", "right", "left"):
-        axh.spines[s].set_visible(False)
-    axh.set_yticks([])
-    axh.tick_params(labelsize=8, colors=GREY)
-
-    # ── trend formy ──
-    fig.text(0.07, 0.472, "Trend PM Score", fontsize=12, weight="bold", color=INK)
-    axt = fig.add_axes([0.07, 0.345, 0.86, 0.105])
-    slope_txt = "—"
-    if pm_rows is not None and len(pm_rows):
-        g = pm_rows.sort_values("match_date")
-        y = pd.to_numeric(g["_sc"], errors="coerce").to_numpy()
-        roll = pd.Series(y).rolling(3, min_periods=1).mean().to_numpy()
-        x = np.arange(len(y))
-        axt.plot(x, y, marker="o", ms=3, lw=0, color="#c9d2dc")
-        axt.plot(x, roll, lw=2.4, color=GREEN)
-        if len(y) >= 3 and np.isfinite(y).sum() >= 3:
-            b = np.polyfit(x[np.isfinite(y)], y[np.isfinite(y)], 1)[0] * 100
-            arrow = "rośnie" if b > 0.05 else ("spada" if b < -0.05 else "stabilna")
-            slope_txt = f"{arrow} {b:+.1f} / kolejkę"
-    fig.text(0.93, 0.472, slope_txt, ha="right", fontsize=12, weight="bold", color=GREEN)
-    axt.set_xticks([])
-    for s in ("top", "right", "left"):
-        axt.spines[s].set_visible(False)
-    axt.tick_params(labelsize=8, colors=GREY)
-
-    # ── Top 10 rocznika ──
-    fig.text(0.07, 0.310, f"Top 10 rocznika {int(year)} w Polsce", fontsize=12, weight="bold", color=INK)
-    fig.text(0.60, 0.310, "PM Score", fontsize=8.5, color=GREY)
-    y0 = 0.284
-    for i, (rank, name, sc) in enumerate(top_pdf[:10]):
-        mine = str(name) == str(r.get("zawodnik"))
-        w = "bold" if mine else "normal"
-        col = RED if mine else INK
-        fig.text(0.09, y0 - i * 0.0195, f"{i + 1:>2}.", fontsize=10, color=GREY)
-        fig.text(0.15, y0 - i * 0.0195, str(name), fontsize=10, color=col, weight=w)
-        fig.text(0.61, y0 - i * 0.0195, f"{float(sc) * 100:.0f}", fontsize=10, color=col, weight=w)
-
-    # ── twój następny krok (dynamiczne wskazówki) ──
-    head, steps = rekomendacja(r, min_min)
-    fig.text(0.07, 0.105, "TWÓJ NASTĘPNY KROK", fontsize=8.5, weight="bold", color=GREY)
-    fig.text(0.07, 0.086, head, fontsize=11, weight="bold", color=INK)
-    yy = 0.068
-    for stp in steps[:3]:
-        fig.text(0.07, yy, "• " + stp[:118], fontsize=7.6, color=GREY)
-        yy -= 0.0145
-
-    # ── stopka ──
-    foot = (f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. "
-            f"Ranking krajowy wśród zawodników z min. {min_min} min. "
-            f"Wygenerowano {_dt.date.today():%Y-%m-%d}.")
-    fig.text(0.07, 0.028, foot, fontsize=7.5, color=GREY)
-
-    # ── strona 2: podsumowanie sezonu — mecze ──
-    fig2 = _pdf_match_log(r, pm_rows, year)
-
+    """PDF w ciemnym stylu PlayMaker: str.1 = raport, str.2 = sezon + mecze, str.3+ = reszta meczów."""
+    figs = [_pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min),
+            _pdf_page2(r, pm_rows, year, min_min)]
+    if pm_rows is not None and len(pm_rows) > MATCH_ROWS_P2:
+        rest = pm_rows.sort_values("match_date").iloc[MATCH_ROWS_P2:]
+        part = 1
+        while len(rest):
+            part += 1
+            figs.append(_pdf_matches_page(r, rest.iloc[:MATCH_ROWS_PN], year, min_min, part))
+            rest = rest.iloc[MATCH_ROWS_PN:]
     buf = io.BytesIO()
     from matplotlib.backends.backend_pdf import PdfPages
     with PdfPages(buf) as pp:
-        pp.savefig(fig)
-        if fig2 is not None:
-            pp.savefig(fig2)
-    plt.close(fig)
-    if fig2 is not None:
-        plt.close(fig2)
+        for f in figs:
+            if f is not None:
+                pp.savefig(f, facecolor=f.get_facecolor())
+    for f in figs:
+        if f is not None:
+            plt.close(f)
     buf.seek(0)
     return buf.getvalue()
 
 
-def _pdf_match_log(r, pm_rows, year):
-    """Strona 2 PDF: log meczów sezonu (data, rozgrywki, przeciwnik, minuty, gole, kartki, wynik, PM)."""
-    if pm_rows is None or not len(pm_rows) or "_sc" not in pm_rows.columns:
-        return None
-    RED, INK, GREY, BG = "#e2231a", "#1b1f24", "#8a94a3", "#eef1f5"
-    RESMAP = {"wygrana": "W", "remis": "R", "porażka": "P"}
-    g = pm_rows.sort_values("match_date").copy()
+# ── paleta (jak w projekcie) ─────────────────────────────────────────────────
+BG      = "#0A0A0B"
+CARD    = "#161619"
+CARD2   = "#1E1E22"
+EDGE    = "#26262B"
+TXT     = "#F5F5F7"
+MUTED   = "#8B8B93"
+RED     = "#E8232A"
+RED_DIM = "#3A1416"
+AMBER   = "#F0B429"
+AMBER_D = "#3A2D12"
+GREEN   = "#22A06B"
+
+
+def _dark_fig():
     fig = plt.figure(figsize=(8.27, 11.69), dpi=150)
-    fig.patch.set_facecolor("white")
-    fig.text(0.07, 0.960, "PODSUMOWANIE SEZONU — MECZE", fontsize=13, weight="bold", color=INK)
-    fig.text(0.07, 0.933, f"{r.get('zawodnik') or '—'}   ·   rocznik {int(year)}", fontsize=12, color=GREY)
-
-    mn = pd.to_numeric(g["minutes"], errors="coerce").fillna(0)
-    gl = pd.to_numeric(g["goals"], errors="coerce").fillna(0)
-    yc = pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0)
-    rc = pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0)
-    sc = pd.to_numeric(g["_sc"], errors="coerce")
-    minsum = max(1.0, mn.sum())
-    res = g.get("match_result").astype(str) if "match_result" in g.columns else pd.Series([], dtype=str)
-    tot = (f"Mecze: {len(g)}   ·   Minuty: {int(mn.sum())}   ·   Gole: {int(gl.sum())}   ·   "
-           f"Śr. PM Score: {sc.mean() * 100:.0f}")
-    fig.text(0.07, 0.908, tot, fontsize=10.5, weight="bold", color=INK,
-             bbox=dict(boxstyle="round,pad=0.4", fc=BG, ec="none"))
-    ana = (f"Gole/90: {gl.sum() / minsum * 90:.2f}    Kartki/90: {(yc.sum() + rc.sum()) / minsum * 90:.2f}"
-           f"    Min/mecz: {mn.mean():.0f}")
-    if len(res):
-        ana += f"    Zwycięstwa: {(res == 'wygrana').mean() * 100:.0f}%"
-    fig.text(0.07, 0.882, ana, fontsize=9.5, color=GREY)
-
-    # rozgrywki = play_name, fallback league_name
-    rozg = g.get("play_name")
-    if rozg is None or rozg.isna().all():
-        rozg = g.get("league_name")
-
-    # nagłówki kolumn (x, ha)
-    C = {"Data": (0.07, "left"), "Rozgrywki": (0.155, "left"), "Przeciwnik": (0.375, "left"),
-         "Min": (0.685, "right"), "G": (0.735, "right"), "K": (0.785, "right"),
-         "W": (0.825, "left"), "PM": (0.950, "right")}
-    y = 0.848
-    for name, (x, ha) in C.items():
-        fig.text(x, y, name, fontsize=8.5, weight="bold", color=GREY, ha=ha)
-    fig.add_artist(plt.Line2D([0.07, 0.955], [y - 0.006, y - 0.006], color=BG, lw=1))
-
-    step, y = 0.0196, y - 0.024
-    maxrows = int((y - 0.045) / step)
-    idx = g.index[:maxrows]
-    for k, i in enumerate(idx):
-        yy = y - k * step
-        date = pd.to_datetime(g.at[i, "match_date"]).strftime("%Y-%m-%d") if pd.notna(g.at[i, "match_date"]) else "—"
-        rz = str(rozg.loc[i] if rozg is not None else "")[:22]
-        opp = str(g.at[i, "opponent_name"])[:26] if "opponent_name" in g.columns and pd.notna(g.at[i, "opponent_name"]) else "—"
-        fig.text(0.07, yy, date, fontsize=7.6, color=INK)
-        fig.text(0.155, yy, rz, fontsize=7.6, color=INK)
-        fig.text(0.375, yy, opp, fontsize=7.6, color=INK)
-        fig.text(0.685, yy, f"{int(mn.loc[i])}", fontsize=7.6, color=INK, ha="right")
-        fig.text(0.735, yy, f"{int(gl.loc[i])}", fontsize=7.6, color=INK, ha="right")
-        fig.text(0.785, yy, f"{int(yc.loc[i] + rc.loc[i])}", fontsize=7.6, color=INK, ha="right")
-        fig.text(0.825, yy, RESMAP.get(str(g.at[i, "match_result"]) if "match_result" in g.columns else "", ""),
-                 fontsize=7.6, color=GREY)
-        fig.text(0.950, yy, f"{float(sc.loc[i]) * 100:.0f}", fontsize=7.6, color=INK, ha="right", weight="bold")
-    if len(g) > maxrows:
-        fig.text(0.07, y - maxrows * step, f"… oraz {len(g) - maxrows} kolejnych meczów",
-                 fontsize=8, color=GREY, style="italic")
-    fig.text(0.07, 0.028, "W = wygrana · R = remis · P = porażka · K = kartki (żółte+czerwone)",
-             fontsize=7.5, color=GREY)
+    fig.patch.set_facecolor(BG)
     return fig
 
+
+def _card(fig, x, y, w, h, fc=CARD, ec=EDGE, lw=0.8, r=0.018):
+    from matplotlib.patches import FancyBboxPatch
+    p = FancyBboxPatch((x, y), w, h, boxstyle=f"round,pad=0,rounding_size={r}",
+                       transform=fig.transFigure, fc=fc, ec=ec, lw=lw, zorder=0)
+    fig.patches.append(p)
+    return p
+
+
+def _chip(fig, x, y, text, fc=CARD2, tc=TXT, ec=EDGE, fs=8.5, weight="normal", pad=0.010):
+    t = fig.text(x + pad, y, text, fontsize=fs, color=tc, va="center", weight=weight, zorder=3)
+    fig.canvas.draw()
+    bb = t.get_window_extent(renderer=fig.canvas.get_renderer())
+    inv = fig.transFigure.inverted()
+    w = inv.transform((bb.x1, 0))[0] - inv.transform((bb.x0, 0))[0]
+    _card(fig, x, y - 0.0125, w + 2 * pad, 0.025, fc=fc, ec=ec, r=0.012)
+    return x + w + 2 * pad + 0.008
+
+
+def _logo(fig, x, y):
+    _card(fig, x, y - 0.012, 0.205, 0.030, fc="#FFFFFF", ec="#FFFFFF", r=0.008)
+    _card(fig, x + 0.012, y - 0.0075, 0.021, 0.021, fc=RED, ec=RED, r=0.005)
+    fig.text(x + 0.0225, y, "P", fontsize=10, color="#FFFFFF", weight="bold",
+             ha="center", va="center", zorder=4)
+    fig.text(x + 0.042, y, "PLAYMAKER", fontsize=10.5, color="#111", weight="bold", va="center", zorder=4)
+    fig.text(x + 0.163, y - 0.001, ".pro", fontsize=7, color=RED, weight="bold", va="center", zorder=4)
+
+
+def _tile(fig, x, y, w, h, value, label):
+    _card(fig, x, y, w, h, fc=CARD2, ec=EDGE, r=0.012)
+    fig.text(x + w / 2, y + h * 0.60, value, fontsize=15, color=TXT, weight="bold",
+             ha="center", va="center", zorder=3)
+    fig.text(x + w / 2, y + h * 0.24, label, fontsize=6.4, color=MUTED, ha="center",
+             va="center", zorder=3)
+
+
+def _slope(pm_rows):
+    if pm_rows is None or not len(pm_rows):
+        return None
+    y = pd.to_numeric(pm_rows.sort_values("match_date")["_sc"], errors="coerce").to_numpy()
+    ok = np.isfinite(y)
+    if ok.sum() < 3:
+        return None
+    return np.polyfit(np.arange(len(y))[ok], y[ok], 1)[0] * 100
+
+
+# ── STRONA 1 ─────────────────────────────────────────────────────────────────
+def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
+    fig = _dark_fig()
+    X, W = 0.09, 0.82
+    pm = float(r.get("pm_score") or 0) * 100
+    elig = bool(r.get("eligible"))
+
+    _logo(fig, X, 0.947)
+    fig.text(X + W, 0.947, f"SEZON {_secret('PM_SEASON_LABEL', '2025/26')}", fontsize=8.5,
+             color=MUTED, weight="bold", ha="right", va="center")
+
+    # ── HERO ──
+    _card(fig, X, 0.792, W, 0.128)
+    fig.text(X + 0.025, 0.898, "TWÓJ RAPORT", fontsize=7.5, color=RED, weight="bold")
+    fig.text(X + 0.025, 0.868, str(r.get("zawodnik") or "—"), fontsize=21, color=TXT, weight="bold")
+    cx = _chip(fig, X + 0.025, 0.827, f"Rocznik {int(year)}")
+    cx = _chip(fig, cx, 0.827, str(r.get("region_name") or "—"))
+    if bool(r.get("gra_ze_starszymi")):
+        n = r.get("roczniki_w_gore")
+        lbl = f"Gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "Gra ze starszymi"
+        _chip(fig, cx, 0.827, lbl, fc=RED_DIM, tc=RED, ec=RED, weight="bold")
+
+    _card(fig, X + 0.60, 0.828, 0.115, 0.068, fc="#FBE9EA", ec="#FBE9EA", r=0.012)
+    fig.text(X + 0.6575, 0.862, f"{pm:.0f}", fontsize=26, color=RED, weight="bold",
+             ha="center", va="center", zorder=3)
+    fig.text(X + 0.6575, 0.814, "PM SCORE", fontsize=7, color=MUTED, weight="bold", ha="center")
+    sl = _slope(pm_rows)
+    if sl is not None:
+        up = sl >= 0
+        _card(fig, X + 0.728, 0.856, 0.075, 0.030, fc=(GREEN + "22") if up else AMBER_D,
+              ec=GREEN if up else AMBER, r=0.010)
+        fig.text(X + 0.7655, 0.871, f"{'▲' if up else '▼'} {sl:+.1f}", fontsize=9,
+                 color=GREEN if up else AMBER, weight="bold", ha="center", va="center", zorder=3)
+
+    # ── CO TO JEST PM SCORE ──
+    _card(fig, X, 0.648, W, 0.126)
+    fig.text(X + 0.025, 0.752, "Co to jest PM Score?", fontsize=10.5, color=TXT, weight="bold")
+    fig.text(X + 0.025, 0.729, "Wskaźnik potencjału piłkarza w skali 0–100. Pokazuje:",
+             fontsize=8.6, color=MUTED)
+    for i, b in enumerate(["w jakiej formie jest piłkarz,",
+                           "jaki ma wpływ na drużynę,",
+                           "jaki prezentuje potencjał rozwojowy."]):
+        fig.text(X + 0.035, 0.706 - i * 0.017, "•  " + b, fontsize=8.4, color=TXT)
+
+    # ── GDZIE JESTEŚ ──
+    _card(fig, X, 0.470, W, 0.160)
+    fig.text(X + 0.025, 0.608, "Gdzie jesteś na tle rocznika?", fontsize=11.5, color=TXT, weight="bold")
+    if elig:
+        fig.text(X + 0.025, 0.585, f"Miejsce {int(r['rank_nat']):,} na {int(r['cohort_n']):,} "
+                 f"zawodników rocznika {int(year)} w Polsce".replace(",", " "),
+                 fontsize=8.6, color=MUTED)
+        # pasek gradientowy
+        axb = fig.add_axes([X + 0.025, 0.545, W - 0.05, 0.016], zorder=3)
+        grad = np.linspace(0, 1, 256).reshape(1, -1)
+        from matplotlib.colors import LinearSegmentedColormap
+        cmap = LinearSegmentedColormap.from_list("pm", ["#2A2A30", "#7A1B20", RED])
+        axb.imshow(grad, aspect="auto", cmap=cmap, extent=[0, 1, 0, 1])
+        axb.set_xticks([]); axb.set_yticks([]); axb.set_facecolor(BG)
+        for sp in axb.spines.values():
+            sp.set_visible(False)
+        p = float(r["pctl"])
+        axb.plot([p], [0.5], "o", ms=9, mfc="#FFFFFF", mec="#FFFFFF", clip_on=False, zorder=5)
+        xt = X + 0.025 + p * (W - 0.05)
+        _chip(fig, max(X + 0.025, xt - 0.018), 0.575, "TY", fc="#FFFFFF", tc="#111", ec="#FFFFFF",
+              fs=7.5, weight="bold", pad=0.007)
+        fig.text(X + 0.025, 0.532, "Niższy PM Score", fontsize=7, color=MUTED, va="top")
+        fig.text(X + W - 0.025, 0.532, "Wyższy PM Score", fontsize=7, color=MUTED, ha="right", va="top")
+        _card(fig, X + 0.025, 0.482, W - 0.05, 0.040, fc=CARD2, ec=EDGE, r=0.012)
+        przed = p * 100
+        msg = (f"Wyprzedzasz {przed:.0f}% zawodników swojego rocznika w kraju"
+               + (f"  ·  TOP {100 - przed:.0f}%." if przed >= 50 else ".")
+               + "  Jak rosnąć — patrz strona 2.")
+        fig.text(X + 0.038, 0.502, msg, fontsize=8.4, color=TXT, va="center", zorder=3)
+    else:
+        fig.text(X + 0.025, 0.560, f"Za mało minut na ranking krajowy "
+                 f"({int(r.get('min_total') or 0)} min, próg {min_min} min).",
+                 fontsize=9, color=MUTED)
+
+    # ── TOP 10 ──
+    _card(fig, X, 0.055, W, 0.398)
+    fig.text(X + 0.025, 0.428, f"Top 10 rocznika {int(year)} w Polsce", fontsize=11.5,
+             color=TXT, weight="bold")
+    fig.text(X + W - 0.025, 0.428, "PM Score", fontsize=7.5, color=MUTED, ha="right")
+    y0, rh = 0.372, 0.0345
+    for i, (rank, name, sc) in enumerate(top_pdf[:10]):
+        mine = str(name) == str(r.get("zawodnik"))
+        _card(fig, X + 0.020, y0 - i * rh, W - 0.040, 0.028,
+              fc=RED_DIM if mine else CARD2, ec=RED if mine else EDGE, r=0.010)
+        fig.text(X + 0.042, y0 - i * rh + 0.014, f"{i + 1}", fontsize=8, color=RED if mine else MUTED,
+                 weight="bold", ha="center", va="center", zorder=3)
+        fig.text(X + 0.062, y0 - i * rh + 0.014, str(name), fontsize=9.2,
+                 color=TXT, weight="bold" if mine else "normal", va="center", zorder=3)
+        fig.text(X + W - 0.042, y0 - i * rh + 0.014, f"{float(sc) * 100:.0f}", fontsize=9.5,
+                 color=RED, weight="bold", ha="right", va="center", zorder=3)
+    return fig
+
+
+# ── STRONA 2 ─────────────────────────────────────────────────────────────────
+def _pdf_page2(r, pm_rows, year, min_min):
+    fig = _dark_fig()
+    X, W = 0.09, 0.82
+    _logo(fig, X, 0.947)
+    fig.text(X + W, 0.947, f"{r.get('zawodnik') or '—'}  ·  rocznik {int(year)}", fontsize=8.5,
+             color=MUTED, weight="bold", ha="right", va="center")
+
+    # ── JAK PODBIĆ PM SCORE (dynamiczne) ──
+    head, steps = rekomendacja(r, min_min)
+    _card(fig, X, 0.735, W, 0.185)
+    fig.text(X + 0.025, 0.898, "Jak podbić swój PM Score?", fontsize=11.5, color=TXT, weight="bold")
+    fig.text(X + 0.025, 0.876, head, fontsize=9, color=RED, weight="bold")
+    for i, stp in enumerate(steps[:3]):
+        yy = 0.842 - i * 0.040
+        _card(fig, X + 0.020, yy - 0.013, W - 0.040, 0.034, fc=CARD2, ec=EDGE, r=0.010)
+        fig.text(X + 0.040, yy + 0.004, str(i + 1), fontsize=9, color=RED, weight="bold",
+                 ha="center", va="center", zorder=3)
+        txt = "\n".join(textwrap.wrap(str(stp), 88)[:2])   # zawijaj, nie ucinaj w pół słowa
+        fig.text(X + 0.058, yy + 0.004, txt, fontsize=7.4, color=TXT, va="center",
+                 linespacing=1.35, zorder=3)
+
+    # ── TWÓJ SEZON W LICZBACH ──
+    g = pm_rows.sort_values("match_date").copy() if pm_rows is not None and len(pm_rows) else pd.DataFrame()
+    _card(fig, X, 0.545, W, 0.170)
+    fig.text(X + 0.025, 0.693, "Twój sezon w liczbach", fontsize=11.5, color=TXT, weight="bold")
+    if len(g):
+        mn = pd.to_numeric(g["minutes"], errors="coerce").fillna(0)
+        gl = pd.to_numeric(g["goals"], errors="coerce").fillna(0)
+        yc = pd.to_numeric(g.get("yellow_cards"), errors="coerce").fillna(0)
+        rc = pd.to_numeric(g.get("red_cards"), errors="coerce").fillna(0)
+        sc = pd.to_numeric(g["_sc"], errors="coerce")
+        ms = max(1.0, mn.sum())
+        res = g["match_result"].astype(str) if "match_result" in g.columns else pd.Series([], dtype=str)
+        vals = [(f"{len(g)}", "MECZE"), (f"{int(mn.sum())}", "MINUTY"), (f"{int(gl.sum())}", "GOLE"),
+                (f"{sc.mean() * 100:.0f}", "ŚR. PM SCORE"),
+                (f"{gl.sum() / ms * 90:.2f}", "GOLE / 90 MIN"),
+                (f"{(yc.sum() + rc.sum()) / ms * 90:.2f}", "KARTKI / 90 MIN"),
+                (f"{mn.mean():.0f}", "MIN / MECZ"),
+                (f"{(res == 'wygrana').mean() * 100:.0f}%" if len(res) else "—", "ZWYCIĘSTWA")]
+        tw, gap = 0.178, 0.019
+        for k, (v, lab) in enumerate(vals):
+            col, row = k % 4, k // 4
+            _tile(fig, X + 0.022 + col * (tw + gap), 0.612 - row * 0.062, tw, 0.052, v, lab)
+
+    # ── WSZYSTKIE MECZE (część 1; reszta na kolejnych stronach) ──
+    _card(fig, X, 0.045, W, 0.478)
+    fig.text(X + 0.025, 0.498, "Wszystkie mecze sezonu", fontsize=11.5, color=TXT, weight="bold")
+    if not len(g):
+        fig.text(X + 0.025, 0.470, "Brak danych meczowych.", fontsize=9, color=MUTED)
+        _pdf_footer(fig, X, min_min)
+        return fig
+    _match_rows(fig, X, W, g.iloc[:MATCH_ROWS_P2], y0=0.452)
+    _pdf_footer(fig, X, min_min)
+    return fig
+
+
+MATCH_ROWS_P2 = 14      # mecze na stronie 2 (pod kaflami)
+MATCH_ROWS_PN = 26      # mecze na kolejnych stronach (cała strona)
+_RES = {"wygrana": ("W", GREEN), "remis": ("R", AMBER), "porażka": ("P", RED)}
+
+
+def _match_rows(fig, X, W, rows, y0):
+    """Rysuje wiersze meczów od y0 w dół. Nagłówki kolumn nad pierwszym wierszem."""
+    rh = 0.0272
+    for xx, lab in ((0.545, "MIN"), (0.625, "GOLE"), (0.700, "KARTKI")):
+        fig.text(X + xx, y0 + 0.019, lab, fontsize=6, color=MUTED, ha="right")
+    fig.text(X + W - 0.038, y0 + 0.019, "PM", fontsize=6, color=MUTED, ha="right")
+    for k, i in enumerate(rows.index):
+        yy = y0 - k * rh
+        _card(fig, X + 0.020, yy - 0.009, W - 0.040, 0.023, fc=CARD2, ec=EDGE, r=0.008)
+        res = str(rows.at[i, "match_result"]) if "match_result" in rows.columns else ""
+        rs, rc_ = _RES.get(res, ("–", MUTED))
+        fig.text(X + 0.036, yy + 0.0025, rs, fontsize=7.5, color=rc_, weight="bold",
+                 ha="center", va="center", zorder=3)
+        opp = (str(rows.at[i, "opponent_name"])[:30]
+               if "opponent_name" in rows.columns and pd.notna(rows.at[i, "opponent_name"]) else "—")
+        fig.text(X + 0.052, yy + 0.0025, opp, fontsize=7.6, color=TXT, va="center", zorder=3)
+        d = pd.to_datetime(rows.at[i, "match_date"], errors="coerce")
+        fig.text(X + 0.395, yy + 0.0025, d.strftime("%d.%m.%Y") if pd.notna(d) else "—",
+                 fontsize=7, color=MUTED, va="center", zorder=3)
+        mn_ = int(pd.to_numeric(rows.at[i, "minutes"], errors="coerce") or 0)
+        gl_ = int(pd.to_numeric(rows.at[i, "goals"], errors="coerce") or 0)
+        kk = int((pd.to_numeric(rows.at[i, "yellow_cards"], errors="coerce") or 0)
+                 + (pd.to_numeric(rows.at[i, "red_cards"], errors="coerce") or 0))
+        pmv = float(pd.to_numeric(rows.at[i, "_sc"], errors="coerce") or 0) * 100
+        for xx, v in ((0.545, f"{mn_}′"), (0.625, f"{gl_}"), (0.700, f"{kk}")):
+            fig.text(X + xx, yy + 0.0025, v, fontsize=7.6, color=TXT, ha="right", va="center", zorder=3)
+        fig.text(X + W - 0.038, yy + 0.0025, f"{pmv:.0f}", fontsize=8, color=RED, weight="bold",
+                 ha="right", va="center", zorder=3)
+
+
+def _pdf_footer(fig, X, min_min):
+    fig.text(X, 0.030, "W = wygrana · R = remis · P = porażka · Kartki = żółte + czerwone",
+             fontsize=6.8, color=MUTED)
+    fig.text(X, 0.018, f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. Ranking krajowy "
+             f"wśród zawodników z min. {min_min} min. Wygenerowano {_dt.date.today():%d.%m.%Y}.",
+             fontsize=6.2, color=MUTED)
+
+
+def _pdf_matches_page(r, rows, year, min_min, part):
+    """Kolejna strona z meczami (gdy sezon nie mieści się na stronie 2)."""
+    fig = _dark_fig()
+    X, W = 0.09, 0.82
+    _logo(fig, X, 0.947)
+    fig.text(X + W, 0.947, f"{r.get('zawodnik') or '—'}  ·  rocznik {int(year)}", fontsize=8.5,
+             color=MUTED, weight="bold", ha="right", va="center")
+    _card(fig, X, 0.045, W, 0.855)
+    fig.text(X + 0.025, 0.873, f"Wszystkie mecze sezonu (cd. {part})", fontsize=11.5,
+             color=TXT, weight="bold")
+    _match_rows(fig, X, W, rows, y0=0.828)
+    _pdf_footer(fig, X, min_min)
+    return fig
 
 def check_password():
     pw = _secret("APP_PASSWORD", "")

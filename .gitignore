@@ -1,3 +1,7 @@
 kohorta.csv
 __pycache__/
 *.pyc
+
+kohorta_ALL.csv
+kohorta_*.csv
+data/_split/

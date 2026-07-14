@@ -39,9 +39,8 @@ CURRENT_SEASON = _secret("PM_SEASON_ID", "e9d66181-d03e-4bb3-b889-4da848f4831d")
 DATA_MODE = (_secret("PM_DATA_MODE", "csv") or "csv").lower()
 MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "300") or "300"))
 
-AGG_PATH = _secret("PM_AGG_CSV", "kohorta_agg.csv.gz")
-TREND_PATH = _secret("PM_TREND_CSV", "kohorta_trend.csv.gz")
-COHORT_CSV = _secret("PM_COHORT_CSV", "kohorta.csv")
+AGG_PATH = _secret("PM_AGG", "data/kohorta_agg.parquet")
+MATCHES_DIR = _secret("PM_MATCHES", "data/matches")
 
 PZPN_CAT = {2006: "A1 / U-19", 2007: "A2 / U-18", 2008: "B1 / U-17", 2009: "B2 / U-16",
             2010: "C1 / U-15", 2011: "C2 / U-14", 2012: "D1 / U-13", 2013: "D2 / U-12",
@@ -72,48 +71,61 @@ def _read_csv(path):
     return pd.read_csv(path, encoding="latin-1")
 
 
+_AGG_NUMS2 = ["rocznik_final", "min_total", "mecze", "gole", "kartki", "pm_score", "pm_quality",
+              "gole_per90", "kartki_per90", "forma", "kons", "roczniki_w_gore",
+              "clj_minutes", "senior_minutes", "szczebel"]
+
+
 @st.cache_data(show_spinner=False)
-def load_agg(path):
-    df = _read_csv(path)
-    for c in _AGG_NUMS:
+def load_agg():
+    """Warstwa rankingowa: 1 wiersz na zawodnika, wszystkie roczniki. Ładowana w całości."""
+    df = pd.read_parquet(AGG_PATH)
+    for c in _AGG_NUMS2:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     if "gra_ze_starszymi" in df.columns:
         df["gra_ze_starszymi"] = (df["gra_ze_starszymi"].astype(str).str.strip().str.lower()
                                   .isin(["true", "1", "t", "yes"]))
+    df["player_id"] = df["player_id"].astype(str)
     return df
 
 
 @st.cache_data(show_spinner=False)
-def load_trend(path):
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=["player_id", "match_date", "minutes", "_sc"])
-    df = _read_csv(path)
-    df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
+def load_player_matches(pid, rocznik_final):
+    """Warstwa szczegółowa: mecze JEDNEGO zawodnika, czytane z partycji (bez ładowania reszty)."""
+    empty = pd.DataFrame(columns=["player_id", "match_date", "minutes", "_sc"])
+    if not os.path.exists(MATCHES_DIR):
+        return empty
+    flt = [("player_id", "==", str(pid))]
+    try:
+        if pd.notna(rocznik_final):
+            flt = [("rocznik_final", "==", int(rocznik_final)), ("player_id", "==", str(pid))]
+        df = pd.read_parquet(MATCHES_DIR, filters=flt)
+    except Exception:
+        try:
+            df = pd.read_parquet(MATCHES_DIR, filters=[("player_id", "==", str(pid))])
+        except Exception:
+            return empty
+    if "match_date" in df.columns:
+        df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
     for c in ("minutes", "goals", "yellow_cards", "red_cards", "_sc"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_cohort_csv(path):
-    return _coerce(_read_csv(path))
-
-
-@st.cache_data(show_spinner=False)
-def load_cohort_db(season_id, birth_year):
-    import psycopg2
-    import re
-    sql = open("kohorta_rocznik.sql", encoding="utf-8").read()
-    sql = re.sub(r"'[^']*'::text\s+AS season_id", f"'{season_id}'::text AS season_id", sql, count=1)
-    sql = re.sub(r"\b\d{4}::int\s+AS birth_year", f"{int(birth_year)}::int AS birth_year", sql, count=1)
-    conn = psycopg2.connect(host=_secret("PGHOST"), dbname=_secret("PGDATABASE"),
-                            user=_secret("PGUSER"), password=_secret("PGPASSWORD"),
-                            port=_secret("PGPORT", "5432") or "5432")
-    df = pd.read_sql(sql, conn)
-    conn.close()
-    return _coerce(df)
+def build_pool(agg, declared_Y, requester):
+    """Pula rówieśników = kubełek rocznik_final == declared_Y + wstrzyknięty zgłaszający.
+    Zgłaszający ZAWSZE w mianowniku swojego zadeklarowanego rocznika (priorytet nad floorem)."""
+    pool = agg[agg["rocznik_final"] == declared_Y].copy()
+    if str(requester["player_id"]) not in set(pool["player_id"]):
+        rr = requester.copy()
+        rr["rocznik_final"] = declared_Y
+        pool = pd.concat([pool, rr.to_frame().T], ignore_index=True)
+    for c in ("pm_score", "pm_quality", "gole_per90", "kartki_per90", "min_total", "kons"):
+        if c in pool.columns:
+            pool[c] = pd.to_numeric(pool[c], errors="coerce")
+    return pool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -552,8 +564,11 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
     _card(fig, X, 0.470, W, 0.160)
     fig.text(X + 0.025, 0.608, "Gdzie jesteś na tle rocznika?", fontsize=11.5, color=TXT, weight="bold")
     if elig:
-        fig.text(X + 0.025, 0.585, f"Miejsce {int(r['rank_nat']):,} na {int(r['cohort_n']):,} "
-                 f"zawodników rocznika {int(year)} w Polsce".replace(",", " "),
+        _rank = int(r['rank_nat'])
+        _rr = _rank if _rank <= 20 else int(round(_rank / 10.0) * 10)
+        _cr = int(round(int(r['cohort_n']) / 100.0) * 100)
+        fig.text(X + 0.025, 0.585, f"Orientacyjnie ≈ {_rr}. miejsce na ~{_cr} "
+                 f"zawodników rocznika {int(year)} w bazie".replace(",", " "),
                  fontsize=8.6, color=MUTED)
         # pasek gradientowy
         axb = fig.add_axes([X + 0.025, 0.545, W - 0.05, 0.016], zorder=3)
@@ -722,8 +737,9 @@ def _match_rows(fig, X, W, rows, y0):
 def _pdf_footer(fig, X, min_min):
     fig.text(X, 0.030, "W = wygrana · R = remis · P = porażka · Kartki = żółte + czerwone",
              fontsize=6.8, color=MUTED)
-    fig.text(X, 0.018, f"PM Score uwzględnia poziom rozgrywek i grę powyżej rocznika. Ranking krajowy "
-             f"wśród zawodników z min. {min_min} min. Wygenerowano {_dt.date.today():%d.%m.%Y}.",
+    fig.text(X, 0.018, f"Rocznik szacowany z wieku podanego w źródłach publicznych, potwierdzany historią gry "
+             f"w kategoriach. Pozycja i liczebność rocznika orientacyjne (pula śledzona z min. {min_min} min, "
+             f"nie pełny spis Polski). Wygenerowano {_dt.date.today():%d.%m.%Y}.",
              fontsize=6.2, color=MUTED)
 
 
@@ -758,35 +774,43 @@ def check_password():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DANE: precomputed jeśli jest, inaczej fallback match-level
+# DANE: agg w całości (parquet), mecze jednego gracza na żądanie
 # ─────────────────────────────────────────────────────────────────────────────
-def get_year_and_data(year_widget_key="rok"):
-    precomputed = os.path.exists(AGG_PATH)
-    if precomputed:
-        agg = load_agg(AGG_PATH)
-        years = sorted(pd.to_numeric(agg["est_birth_year"], errors="coerce").dropna().astype(int).unique())
-        if not years:
-            return None, None, None
-        year = st.sidebar.selectbox("Rocznik", years, index=len(years) - 1, key=year_widget_key)
-        base = agg[pd.to_numeric(agg["est_birth_year"], errors="coerce") == year].copy()
-        trend_all = load_trend(TREND_PATH)
-        trend = (trend_all[trend_all["player_id"].isin(set(base["player_id"]))]
-                 if not trend_all.empty else trend_all)
-        return year, base, trend
+PEWNOSC_OPIS = {"potwierdzony": ("Rocznik potwierdzony", "#22A06B"),
+                "skorygowany": ("Rocznik skorygowany z historii lig", "#F0B429"),
+                "szacowany": ("Rocznik szacowany (do potwierdzenia)", "#8B8B93")}
 
-    # fallback (lokalnie): match-level z DB albo dużego CSV
-    if DATA_MODE == "db":
-        year = st.sidebar.number_input("Rocznik", 2004, 2018, 2010, 1, key=year_widget_key)
-        raw = load_cohort_db(CURRENT_SEASON, int(year))
+
+def pick_requester(agg):
+    """Wybór zawodnika (nazwisko → lista) + zadeklarowany rocznik ze zgłoszenia."""
+    qp_player = st.query_params.get("player")
+    qp_rok = st.query_params.get("rocznik")
+
+    if qp_player and str(qp_player) in set(agg["player_id"]):
+        req = agg[agg["player_id"] == str(qp_player)].iloc[0]
     else:
-        raw = load_cohort_csv(COHORT_CSV)
-        years = sorted(pd.to_numeric(raw["est_birth_year"], errors="coerce").dropna().astype(int).unique())
-        year = st.sidebar.selectbox("Rocznik", years, index=len(years) - 1, key=year_widget_key)
-        raw = raw[pd.to_numeric(raw["est_birth_year"], errors="coerce") == year].copy()
-    if raw.empty:
-        return year, raw, None
-    base, trend = build_cohort(raw)
-    return year, base, trend
+        q = st.sidebar.text_input("Szukaj zawodnika (nazwisko)", "")
+        cand = agg
+        if q.strip():
+            cand = agg[agg["zawodnik"].str.contains(q.strip(), case=False, na=False)]
+        cand = cand.sort_values("zawodnik").head(300)
+        if cand.empty:
+            st.sidebar.info("Wpisz nazwisko, by znaleźć zawodnika.")
+            return None, None
+        labels = {f"{r.zawodnik} · {int(r.rocznik_final)} · {r.club_name or '—'}": r.player_id
+                  for r in cand.itertuples()}
+        choice = st.sidebar.selectbox("Zawodnik", list(labels.keys()))
+        req = agg[agg["player_id"] == labels[choice]].iloc[0]
+
+    years = sorted(agg["rocznik_final"].dropna().astype(int).unique())
+    default_y = int(req["rocznik_final"]) if pd.notna(req["rocznik_final"]) else years[-1]
+    if qp_rok and str(qp_rok).isdigit() and int(qp_rok) in years:
+        declared_y = int(qp_rok)
+    else:
+        declared_y = st.sidebar.selectbox("Rocznik ze zgłoszenia", years,
+                                          index=years.index(default_y) if default_y in years else len(years) - 1,
+                                          help="Rocznik podany przez zawodnika w zgłoszeniu — ma priorytet.")
+    return req, declared_y
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -796,7 +820,6 @@ def main():
     if not check_password():
         return
 
-    # ukryj przycisk pełnego ekranu na wykresach
     st.markdown(
         "<style>[data-testid='StyledFullScreenButton'],button[title='View fullscreen']"
         "{display:none!important;}</style>", unsafe_allow_html=True)
@@ -805,33 +828,33 @@ def main():
     min_min = st.sidebar.slider("Min. minut do oceny", 0, 1500, MIN_MIN_DEFAULT, 50,
                                 help="Poniżej progu nie przypisujemy percentyla — za mała próba.")
 
-    year, base, trend = get_year_and_data()
-    if base is None or base.empty:
-        st.warning("Brak danych. W trybie chmurowym potrzebny jest kohorta_agg.csv.gz "
-                   "(wygeneruj lokalnie: python precompute.py).")
+    if not os.path.exists(AGG_PATH):
+        st.warning("Brak danych. Wygeneruj lokalnie: `python precompute.py` i wrzuć folder `data/`.")
+        return
+    agg = load_agg()
+
+    req, year = pick_requester(agg)
+    if req is None:
+        st.info("Wybierz zawodnika w panelu po lewej, aby wygenerować raport.")
         return
 
-    df = apply_percentiles(base, min_min)
+    pool = build_pool(agg, year, req)
+    df = apply_percentiles(pool, min_min)
     n_all = len(df)
     n_elig = int(df["eligible"].sum())
-
-    # wybór zawodnika (per-link ?player=<id> albo z listy)
-    qp_player = st.query_params.get("player")
-    names = df.sort_values("zawodnik")[["player_id", "zawodnik", "club_name"]]
-    labels = {f"{r.zawodnik} ({r.club_name})": r.player_id for r in names.itertuples()}
-    if qp_player and qp_player in set(df["player_id"]):
-        pid = qp_player
-    else:
-        choice = st.sidebar.selectbox(f"Zawodnik (rocznik {year})", list(labels.keys()))
-        pid = labels[choice]
-
+    pid = str(req["player_id"])
     r = df[df["player_id"] == pid].iloc[0]
+    trend = load_player_matches(pid, req.get("rocznik_final"))
 
     st.markdown(f"### {r['zawodnik']}")
-    st.caption(f"Rocznik {int(year)} · {r.get('club_name') or '—'} · {r.get('region_name') or '—'} · "
-               f"liga wiodąca: {r.get('league_name') or '—'}")
-    st.caption(f"W rankingu rocznika: **{n_all}** zawodników w bazie, **{n_elig}** z wiarygodną próbą "
-               f"(≥ {min_min} min).")
+    st.markdown(
+        f"<span style='color:#8B8B93'>Rocznik {int(year)} (ze zgłoszenia) · "
+        f"{r.get('club_name') or '—'} · {r.get('region_name') or '—'}</span>",
+        unsafe_allow_html=True)
+    st.caption(f"Pula rówieśników: **~{n_all}** zawodników rocznika {int(year)} w bazie — "
+               f"wiek z danych publicznych, skorygowany historią gry w kategoriach; "
+               f"**{n_elig}** z min. {min_min} min. To pula śledzona, nie pełny spis Polski, "
+               f"więc pozycję podajemy orientacyjnie.")
 
     if not r["eligible"]:
         st.info(f"⚠️ Za mało minut na wiarygodną ocenę w skali kraju "
@@ -842,7 +865,13 @@ def main():
         c1, c2 = st.columns([1, 1.3])
         with c1:
             st.markdown(f"#### {pozycja_txt(float(r['pctl']))}")
-            st.metric("Miejsce w kraju (rocznik)", f"{int(r['rank_nat'])} / {int(r['cohort_n'])}")
+            rank = int(r["rank_nat"])
+            rank_round = rank if rank <= 20 else int(round(rank / 10.0) * 10)
+            cohort_round = int(round(int(r["cohort_n"]) / 100.0) * 100)
+            st.metric("Orientacyjna pozycja w roczniku",
+                      f"≈ {rank_round} / ~{cohort_round}",
+                      help="Pozycja i liczebność są przybliżone — pula rówieśników jest szacowana "
+                           "z wieku skorygowanego historią lig, nie ze spisu.")
             st.plotly_chart(gfig, use_container_width=True, config=PLOTLY_CFG)
         with c2:
             st.markdown("#### Gdzie jesteś na tle rocznika")

@@ -132,25 +132,63 @@ def load_name_maps(path_base="teamy_kluby_25_26"):
     except Exception as e:
         print(f"  (nie wczytano mapy nazw: {e})")
         return {}, {}
-    cols = {c.lower().strip(): c for c in mp.columns}
-
-    def pick(idkw, namekws):
-        idc = next((cols[k] for k in cols if idkw in k and "id" in k), None)
-        namec = next((cols[k] for k in cols for nk in namekws if nk in k and "id" not in k), None)
-        return idc, namec
-
-    ti, tn = pick("team", ["team", "nazwa", "name"])
-    ci, cn = pick("club", ["club", "klub", "nazwa", "name"])
-    tmap = dict(zip(mp[ti].astype(str), mp[tn].astype(str))) if ti and tn else {}
-    cmap = dict(zip(mp[ci].astype(str), mp[cn].astype(str))) if ci and cn else {}
-    print(f"  mapa nazw: team {len(tmap)} | club {len(cmap)}")
+    cols = {str(c).lower().strip(): c for c in mp.columns}
+    ti, tn = _pick_pair(cols, "team")
+    ci, cn = _pick_pair(cols, "club")
+    tmap = _build_map(mp, ti, tn)
+    cmap = _build_map(mp, ci, cn)
+    print(f"  mapa nazw: plik={path}")
+    print(f"    team:  {ti} → {tn}   ({len(tmap)} wpisów)")
+    print(f"    club:  {ci} → {cn}   ({len(cmap)} wpisów)")
+    if not tmap and not cmap:
+        print(f"    UWAGA: nie wykryto kolumn id/nazwa. Kolumny w pliku: {list(mp.columns)}")
     return tmap, cmap
 
 
+_TEAM_KEYS = ("team", "druzyn", "drużyn", "zespol", "zespół")
+_CLUB_KEYS = ("club", "klub")
+_NAME_KEYS = ("name", "nazwa")
+
+
+def _pick_pair(cols, kind):
+    """(id_col, name_col) dla 'team' albo 'club'. Kolumna musi zawierać rdzeń swojego
+    rodzaju i NIE zawierać rdzenia drugiego — inaczej team_id łapał club_nazwa."""
+    keys = _TEAM_KEYS if kind == "team" else _CLUB_KEYS
+    anti = _CLUB_KEYS if kind == "team" else _TEAM_KEYS
+
+    def mine(low):
+        return any(k in low for k in keys) and not any(a in low for a in anti)
+
+    idc = next((o for low, o in cols.items()
+                if mine(low) and (low.endswith("id") or "_id" in low or "id_" in low)), None)
+    namec = next((o for low, o in cols.items()
+                  if mine(low) and any(n in low for n in _NAME_KEYS)
+                  and not (low.endswith("id") or "_id" in low or "id_" in low)), None)
+    if namec is None:      # np. kolumna nazywa się po prostu „team” / „klub”
+        namec = next((o for low, o in cols.items()
+                      if mine(low) and not (low.endswith("id") or "_id" in low or "id_" in low)), None)
+    return idc, namec
+
+
+def _build_map(mp, idc, namec):
+    """id → nazwa. Puste nazwy WYRZUCAMY (inaczej astype(str) robi z nich tekst 'nan')."""
+    if not idc or not namec or idc not in mp.columns or namec not in mp.columns:
+        return {}
+    d = mp[[idc, namec]].dropna()
+    key = d[idc].astype(str).str.strip()
+    val = d[namec].astype(str).str.strip()
+    ok = key.ne("") & val.ne("") & ~val.str.lower().isin(["nan", "none", "null"])
+    return dict(zip(key[ok], val[ok]))
+
+
 def _resolve(series_id, series_name, id2name):
+    """Nazwa z mapy, a gdy brak — oryginalna z bazy. Odporne na puste wartości w mapie."""
+    base = (series_name if series_name is not None
+            else pd.Series(np.nan, index=series_id.index, dtype=object))
     if not id2name or series_id is None:
-        return series_name
-    return series_id.astype(str).map(id2name).fillna(series_name)
+        return base
+    mapped = series_id.astype(str).str.strip().map(id2name)
+    return mapped.where(mapped.notna(), base)
 
 
 # ── ETAP 1: przygotowanie chunku (row-independent) + rozdział do przegródek ──

@@ -42,6 +42,20 @@ MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "300") or "300"))
 AGG_PATH = _secret("PM_AGG", "data/kohorta_agg.parquet")
 MATCHES_DIR = _secret("PM_MATCHES", "data/matches")
 
+
+def _txt(v, default="—"):
+    """Bezpieczny tekst do wyświetlenia. UWAGA: NaN jest w Pythonie 'truthy',
+    więc `x or '—'` przepuszcza NaN i renderuje literalne 'nan' — stąd ten helper."""
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return s if s and s.lower() not in ("nan", "none", "<na>") else default
+
 PZPN_CAT = {2006: "A1 / U-19", 2007: "A2 / U-18", 2008: "B1 / U-17", 2009: "B2 / U-16",
             2010: "C1 / U-15", 2011: "C2 / U-14", 2012: "D1 / U-13", 2013: "D2 / U-12",
             2014: "E1 / U-11", 2015: "E2 / U-10", 2016: "F1 / U-9", 2017: "F2 / U-8"}
@@ -236,7 +250,7 @@ def rekomendacja(r, min_min):
         cel = NASTEPNY_SZCZEBEL.get(sz, "wyższy szczebel")
         return (f"Twój poziom jest dla Ciebie za łatwy — celuj w {cel}", [
             f"Jesteś w czołowych {(1 - lvl) * 100:.0f}% zawodników swojego szczebla "
-            f"({r.get('szczebel_nazwa') or '—'}).",
+            f"({_txt(r.get('szczebel_nazwa'))}).",
             f"Konkretny krok: testy w klubie grającym w {cel}.",
             "Jeśli nie grasz w starszym roczniku — poproś trenera o próbę." if not starszy
             else "Grasz już w starszej kategorii — trzymaj tak dalej.",
@@ -268,7 +282,7 @@ def rekomendacja(r, min_min):
     # 4) mocny, ale jeszcze nie dominuje szczebla
     if pd.notna(lvl) and lvl >= 0.60:
         return ("Jesteś blisko — dołóż minut i stabilności", [
-            f"W swoim szczeblu ({r.get('szczebel_nazwa') or '—'}) wyprzedzasz "
+            f"W swoim szczeblu ({_txt(r.get('szczebel_nazwa'))}) wyprzedzasz "
             f"{lvl * 100:.0f}% zawodników.",
             "Celuj w pełne 90 minut i równą formę mecz po meczu.",
             "Spróbuj gry w starszym roczniku — to najszybszy sposób na wzrost PM Score." if not starszy
@@ -280,7 +294,7 @@ def rekomendacja(r, min_min):
         return ("Mocny wynik w skali kraju — czas celować wyżej", [
             f"Wyprzedzasz {pctl * 100:.0f}% rocznika w Polsce.",
             "Rozważ testy w klubie z wyższego szczebla (wojewódzki, docelowo CLJ)."
-            if sz == 0 else f"Rozważ testy o szczebel wyżej niż {r.get('szczebel_nazwa') or '—'}.",
+            if sz == 0 else f"Rozważ testy o szczebel wyżej niż {_txt(r.get('szczebel_nazwa'))}.",
             "Poproś o minuty w starszym roczniku lub w seniorach." if sen == 0 else
             "Masz już minuty w seniorach — zbieraj ich więcej.",
         ])
@@ -527,11 +541,11 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
     h_hero = 0.148 if two_rows else 0.128
     _card(fig, X, 0.920 - h_hero, W, h_hero)
     fig.text(X + 0.025, 0.898, "TWÓJ RAPORT", fontsize=7.5, color=RED, weight="bold")
-    fig.text(X + 0.025, 0.868, str(r.get("zawodnik") or "—"), fontsize=21, color=TXT, weight="bold")
+    fig.text(X + 0.025, 0.868, _txt(r.get("zawodnik")), fontsize=21, color=TXT, weight="bold")
 
     row1, row2 = 0.831, 0.800
     cx = _chip(fig, X + 0.025, row1, f"Rocznik {int(year)}")
-    cx = _chip(fig, cx, row1, str(r.get("region_name") or "—"))
+    cx = _chip(fig, cx, row1, _txt(r.get("region_name")))
     y_chip, xmax = row1, X + 0.470
     for lbl, fc, tc, ec in extras:
         if cx > xmax and y_chip == row1:          # nie mieści się → drugi rząd
@@ -621,7 +635,7 @@ def _pdf_page2(r, pm_rows, year, min_min):
     fig = _dark_fig()
     X, W = 0.09, 0.82
     _logo(fig, X, 0.947)
-    fig.text(X + W, 0.947, f"{r.get('zawodnik') or '—'}  ·  rocznik {int(year)}", fontsize=8.5,
+    fig.text(X + W, 0.947, f"{_txt(r.get('zawodnik'))}  ·  rocznik {int(year)}", fontsize=8.5,
              color=MUTED, weight="bold", ha="right", va="center")
 
     # ── JAK PODBIĆ PM SCORE (dynamiczne) ──
@@ -676,7 +690,7 @@ def _pdf_page2(r, pm_rows, year, min_min):
             _card(fig, X + 0.020, yy - 0.009, W - 0.040, 0.023, fc=CARD2, ec=EDGE, r=0.008)
             nm = str(p["_play"])[:42]
             fig.text(X + 0.036, yy + 0.0025, nm, fontsize=7.2, color=TXT, va="center", zorder=3)
-            fig.text(X + 0.500, yy + 0.0025, str(p["league_name"] or "—")[:9], fontsize=6.8,
+            fig.text(X + 0.500, yy + 0.0025, _txt(p["league_name"])[:9], fontsize=6.8,
                      color=MUTED, ha="right", va="center", zorder=3)
             for xx, v in ((0.585, p["mecze"]), (0.655, f"{p['minuty']}′"), (0.715, p["gole"])):
                 fig.text(X + xx, yy + 0.0025, str(v), fontsize=7.4, color=TXT, ha="right",
@@ -748,7 +762,7 @@ def _pdf_matches_page(r, rows, year, min_min, part):
     fig = _dark_fig()
     X, W = 0.09, 0.82
     _logo(fig, X, 0.947)
-    fig.text(X + W, 0.947, f"{r.get('zawodnik') or '—'}  ·  rocznik {int(year)}", fontsize=8.5,
+    fig.text(X + W, 0.947, f"{_txt(r.get('zawodnik'))}  ·  rocznik {int(year)}", fontsize=8.5,
              color=MUTED, weight="bold", ha="right", va="center")
     _card(fig, X, 0.045, W, 0.855)
     fig.text(X + 0.025, 0.873, f"Wszystkie mecze sezonu (cd. {part})", fontsize=11.5,
@@ -797,7 +811,7 @@ def pick_requester(agg):
         if cand.empty:
             st.sidebar.info("Wpisz nazwisko, by znaleźć zawodnika.")
             return None, None
-        labels = {f"{r.zawodnik} · {int(r.rocznik_final)} · {r.club_name or '—'}": r.player_id
+        labels = {f"{r.zawodnik} · {int(r.rocznik_final)} · {_txt(r.club_name)}": r.player_id
                   for r in cand.itertuples()}
         choice = st.sidebar.selectbox("Zawodnik", list(labels.keys()))
         req = agg[agg["player_id"] == labels[choice]].iloc[0]
@@ -849,7 +863,7 @@ def main():
     st.markdown(f"### {r['zawodnik']}")
     st.markdown(
         f"<span style='color:#8B8B93'>Rocznik {int(year)} (ze zgłoszenia) · "
-        f"{r.get('club_name') or '—'} · {r.get('region_name') or '—'}</span>",
+        f"{_txt(r.get('club_name'))} · {_txt(r.get('region_name'))}</span>",
         unsafe_allow_html=True)
     st.caption(f"Pula rówieśników: **~{n_all}** zawodników rocznika {int(year)} w bazie — "
                f"wiek z danych publicznych, skorygowany historią gry w kategoriach; "

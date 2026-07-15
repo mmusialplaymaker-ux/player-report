@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import sys
+import unicodedata
 
 from collections import Counter, defaultdict
 
@@ -92,6 +93,93 @@ def _detect_encoding(path):
         except (UnicodeDecodeError, UnicodeError):
             continue
     return "latin-1"
+
+
+def _norm_name(s):
+    """Do porównywania nazwisk: bez wielkości liter i bez polskich znaków."""
+    s = str(s).strip().lower().replace("ł", "l").replace("ø", "o")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return " ".join(s.split())
+
+
+def load_manual(path="reczne_korekty.csv", status_path="rocznik_status.csv"):
+    """Ręczne korekty rocznika (weryfikacja w internecie). PRIORYTET nad floorem i nad wiekiem.
+    Kolumny: 'rocznik' (prawdziwy) + 'player_id' ALBO 'zawodnik' + 'rocznik_w_bazie'.
+
+    UWAGA: nazwiska NIE są unikalne (dziesięciu Matysików w bazie!), więc rozwiązujemy je
+    przez rocznik_status.csv do player_id. Wpis pasujący do >1 zawodnika jest POMIJANY —
+    lepiej nie poprawić nikogo niż poprawić przypadkowego imiennika.
+    'rocznik_w_bazie' może być rocznikiem sprzed korekty ALBO po niej — sprawdzamy oba."""
+    if not os.path.exists(path):
+        print(f"  UWAGA: brak {path} — ręczne weryfikacje NIE zostaną nałożone.")
+        return {}, {}
+    mk = _read_flex(path)
+    cols = {str(c).lower().strip(): c for c in mk.columns}
+    ycol = next((cols[k] for k in ("rocznik", "rocznik_prawdziwy", "rocznik_final") if k in cols), None)
+    if ycol is None:
+        print(f"  UWAGA: {path} bez kolumny 'rocznik' — pomijam ręczne korekty.")
+        return {}, {}
+
+    # indeks nazwisko|rocznik -> {player_id} z rocznik_status.csv (do wykrycia imienników)
+    idx = {}
+    if os.path.exists(status_path):
+        st = _read_flex(status_path)
+        c2 = {str(c).lower().strip(): c for c in st.columns}
+        if "player_id" in c2 and "zawodnik" in c2:
+            ycols = [c2[k] for k in ("rocznik_z_daty", "rocznik_final") if k in c2]
+            for row in st[[c2["player_id"], c2["zawodnik"]] + ycols].itertuples(index=False):
+                pid, nm = str(row[0]), _norm_name(row[1])
+                for v in row[2:]:
+                    try:
+                        y = int(float(v))
+                    except (TypeError, ValueError):
+                        continue
+                    idx.setdefault(f"{nm}|{y}", set()).add(pid)
+
+    by_id, by_name, amb, miss = {}, {}, [], []
+    for _, r in mk.iterrows():
+        try:
+            y = int(float(r[ycol]))
+        except (TypeError, ValueError):
+            continue
+        pid = str(r[cols["player_id"]]).strip() if "player_id" in cols else ""
+        if pid and pid.lower() not in ("nan", ""):
+            by_id[pid] = y
+            continue
+        nmc = cols.get("zawodnik") or cols.get("nazwa")
+        bcol = next((cols[k] for k in ("rocznik_w_bazie", "rocznik_z_daty", "est_birth_year") if k in cols), None)
+        if not (nmc and bcol):
+            continue
+        try:
+            b = int(float(r[bcol]))
+        except (TypeError, ValueError):
+            continue
+        nm = str(r[nmc]).strip()
+        pids = sorted(idx.get(f"{_norm_name(nm)}|{b}", set()))
+        if len(pids) == 1:
+            by_id[pids[0]] = y
+        elif len(pids) > 1:
+            amb.append((nm, b, pids))
+        elif idx:
+            miss.append((nm, b))
+        else:
+            by_name[f"{_norm_name(nm)}|{b}"] = y   # brak statusu -> dopasowanie po nazwisku
+
+    print(f"  ręczne korekty ({path}): jednoznacznych {len(by_id)}"
+          + (f", po nazwisku {len(by_name)} (BRAK rocznik_status.csv - ryzyko imienników!)"
+             if by_name else ""))
+    if amb:
+        print(f"  UWAGA: {len(amb)} wpisów pasuje do WIĘCEJ NIŻ JEDNEGO zawodnika — POMINIĘTE:")
+        for nm, b, pids in amb:
+            print(f"     {nm} ({b}) -> {len(pids)} imienników; wstaw player_id do reczne_korekty.csv:")
+            for p in pids[:4]:
+                print(f"        {p}")
+    if miss:
+        print(f"  UWAGA: {len(miss)} wpisów nie znaleziono — sprawdź pisownię i rocznik_w_bazie:")
+        for nm, b in miss:
+            print(f"     {nm} ({b})")
+    return by_id, by_name
 
 
 def load_status(path="rocznik_status.csv"):
@@ -201,7 +289,7 @@ def _resolve(series_id, series_name, id2name):
 
 
 # ── ETAP 1: przygotowanie chunku (row-independent) + rozdział do przegródek ──
-def _prep_chunk(m, fin, pew, tmap, cmap, t2c):
+def _prep_chunk(m, fin, pew, tmap, cmap, t2c, man_id, man_name):
     m = _coerce(m)
     m = m[~m["firstname"].map(_is_female)].copy()
     m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()
@@ -228,6 +316,20 @@ def _prep_chunk(m, fin, pew, tmap, cmap, t2c):
     m["rocznik_final"] = pd.to_numeric(corr, errors="coerce").fillna(
         pd.to_numeric(m["est_birth_year"], errors="coerce"))
     m["rocznik_pewnosc"] = pid_str.map(pew).fillna("szacowany")
+
+    # RĘCZNE KOREKTY — najwyższy priorytet (weryfikacja w internecie bije floor i wiek)
+    if man_id:
+        h = pd.to_numeric(pid_str.map(man_id), errors="coerce")
+        if h.notna().any():
+            m.loc[h.notna(), "rocznik_final"] = h[h.notna()]
+            m.loc[h.notna(), "rocznik_pewnosc"] = "potwierdzony (ręcznie)"
+    if man_name:
+        base = pd.to_numeric(m["est_birth_year"], errors="coerce").astype("Int64").astype(str)
+        key = m["zawodnik"].map(_norm_name) + "|" + base
+        h2 = pd.to_numeric(key.map(man_name), errors="coerce")
+        if h2.notna().any():
+            m.loc[h2.notna(), "rocznik_final"] = h2[h2.notna()]
+            m.loc[h2.notna(), "rocznik_pewnosc"] = "potwierdzony (ręcznie)"
     return m[m["rocznik_final"].notna()]
 
 
@@ -255,7 +357,7 @@ def _collect_regions(m, team_reg, club_reg, t2cid):
                 club_reg[cid][reg] += int(n)
 
 
-def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid):
+def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name):
     shutil.rmtree(SPLIT_DIR, ignore_errors=True)
     os.makedirs(SPLIT_DIR, exist_ok=True)
     part = 0
@@ -264,7 +366,7 @@ def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid):
         enc = _detect_encoding(path)
         print(f"\n→ split {path} (enc={enc})")
         for ci, chunk in enumerate(pd.read_csv(path, encoding=enc, chunksize=CHUNK, low_memory=False)):
-            m = _prep_chunk(chunk, fin, pew, tmap, cmap, t2c)
+            m = _prep_chunk(chunk, fin, pew, tmap, cmap, t2c, man_id, man_name)
             _collect_regions(m, team_reg, club_reg, t2cid)
             for Y, sub in m.groupby(m["rocznik_final"].astype(int)):
                 d = os.path.join(SPLIT_DIR, f"rocznik={int(Y)}")
@@ -374,6 +476,7 @@ def main():
         raise SystemExit("Brak plików wejściowych. Podaj kohorta_ALL.csv albo połóż kohorta_*.csv w folderze.")
     print("Pliki wejściowe:", ", ".join(inputs))
     fin, pew = load_status()
+    man_id, man_name = load_manual()
     tmap, cmap, t2c, t2cid = load_name_maps()
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -384,7 +487,7 @@ def main():
     import pyarrow.parquet as pq
 
     print("\n=== ETAP 1: rozdział po skorygowanym roczniku ===")
-    team_reg, club_reg = split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid)
+    team_reg, club_reg = split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name)
     roczniki = sorted(int(d.split("=")[1]) for d in os.listdir(SPLIT_DIR)
                       if d.startswith("rocznik="))
     print(f"\nRoczniki do agregacji: {roczniki}")
@@ -410,6 +513,13 @@ def main():
     print(f"✓ {MATCHES_DIR}/  {sz_m:.1f} MB (partycje po roczniku)")
     print("\nRozkład pewności rocznika:")
     print(agg["rocznik_pewnosc"].value_counts().to_string())
+    n_man = len(man_id) + len(man_name)
+    if n_man:
+        hit = int((agg["rocznik_pewnosc"] == "potwierdzony (ręcznie)").sum())
+        print(f"\nRęczne korekty: dopasowano {hit} z {n_man} wpisów")
+        if hit < n_man:
+            print("  UWAGA: część wpisów nie trafiła w żadnego zawodnika — sprawdź w reczne_korekty.csv")
+            print("  pisownię nazwiska oraz kolumnę rocznik_w_bazie (musi być rocznik SPRZED korekty).")
     print("\nDo repo idzie CAŁY folder data/ (bez _split). Duże kohorta_*.csv zostają lokalnie.")
 
 

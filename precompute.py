@@ -126,23 +126,25 @@ def load_name_maps(path_base="teamy_kluby_25_26"):
             break
     else:
         print("  (mapa nazw nie znaleziona — nazwy z bazy)")
-        return {}, {}
+        return {}, {}, {}
     try:
         mp = pd.read_excel(path) if path.endswith("xlsx") else _read_flex(path)
     except Exception as e:
         print(f"  (nie wczytano mapy nazw: {e})")
-        return {}, {}
+        return {}, {}, {}
     cols = {str(c).lower().strip(): c for c in mp.columns}
     ti, tn = _pick_pair(cols, "team")
     ci, cn = _pick_pair(cols, "club")
     tmap = _build_map(mp, ti, tn)
     cmap = _build_map(mp, ci, cn)
+    t2c = _build_map(mp, ti, cn)      # team_id → nazwa KLUBU (gdy w bazie brak club_id)
     print(f"  mapa nazw: plik={path}")
     print(f"    team:  {ti} → {tn}   ({len(tmap)} wpisów)")
     print(f"    club:  {ci} → {cn}   ({len(cmap)} wpisów)")
+    print(f"    klub po drużynie: {ti} → {cn}   ({len(t2c)} wpisów)")
     if not tmap and not cmap:
         print(f"    UWAGA: nie wykryto kolumn id/nazwa. Kolumny w pliku: {list(mp.columns)}")
-    return tmap, cmap
+    return tmap, cmap, t2c
 
 
 _TEAM_KEYS = ("team", "druzyn", "drużyn", "zespol", "zespół")
@@ -192,14 +194,24 @@ def _resolve(series_id, series_name, id2name):
 
 
 # ── ETAP 1: przygotowanie chunku (row-independent) + rozdział do przegródek ──
-def _prep_chunk(m, fin, pew, tmap, cmap):
+def _prep_chunk(m, fin, pew, tmap, cmap, t2c):
     m = _coerce(m)
     m = m[~m["firstname"].map(_is_female)].copy()
     m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()
     if "club_id" in m.columns:
-        m["club_name"] = _resolve(m["club_id"], m["club_name"], cmap)
+        m["club_name"] = _resolve(m["club_id"], m.get("club_name"), cmap)
     if "team_id" in m.columns:
-        m["team_name"] = _resolve(m["team_id"], m["team_name"], tmap)
+        m["team_name"] = _resolve(m["team_id"], m.get("team_name"), tmap)
+        # RATUNEK: w bazie brak club_id → nie ma po czym szukać klubu. Odzyskaj klub
+        # po drużynie z mapy, a gdy i tego brak — użyj nazwy drużyny (lepsze niż puste).
+        if "club_name" not in m.columns:
+            m["club_name"] = np.nan
+        miss = m["club_name"].isna()
+        if miss.any() and t2c:
+            m.loc[miss, "club_name"] = m.loc[miss, "team_id"].astype(str).str.strip().map(t2c)
+        miss = m["club_name"].isna()
+        if miss.any() and "team_name" in m.columns:
+            m.loc[miss, "club_name"] = m.loc[miss, "team_name"]
     if "opponent_id" in m.columns:
         m["opponent_name"] = _resolve(m["opponent_id"], m.get("opponent_name"), tmap)
     elif "opponent_name" not in m.columns:
@@ -212,7 +224,7 @@ def _prep_chunk(m, fin, pew, tmap, cmap):
     return m[m["rocznik_final"].notna()]
 
 
-def split_inputs(inputs, fin, pew, tmap, cmap):
+def split_inputs(inputs, fin, pew, tmap, cmap, t2c):
     shutil.rmtree(SPLIT_DIR, ignore_errors=True)
     os.makedirs(SPLIT_DIR, exist_ok=True)
     part = 0
@@ -220,7 +232,7 @@ def split_inputs(inputs, fin, pew, tmap, cmap):
         enc = _detect_encoding(path)
         print(f"\n→ split {path} (enc={enc})")
         for ci, chunk in enumerate(pd.read_csv(path, encoding=enc, chunksize=CHUNK, low_memory=False)):
-            m = _prep_chunk(chunk, fin, pew, tmap, cmap)
+            m = _prep_chunk(chunk, fin, pew, tmap, cmap, t2c)
             for Y, sub in m.groupby(m["rocznik_final"].astype(int)):
                 d = os.path.join(SPLIT_DIR, f"rocznik={int(Y)}")
                 os.makedirs(d, exist_ok=True)
@@ -263,8 +275,9 @@ def aggregate_rocznik(Y):
     out["pm_quality"] = wmean("_sp")
     out["gole_per90"] = (out["gole"] / out["min_total"] * 90).replace([np.inf, -np.inf], np.nan)
     out["kartki_per90"] = (out["kartki"] / out["min_total"] * 90).replace([np.inf, -np.inf], np.nan)
+    _leadcols = [c for c in ("club_name", "team_name", "region_name", "league_name") if c in m.columns]
     lead = (m.sort_values("_mn", ascending=False)
-            .groupby("player_id")[["club_name", "region_name", "league_name"]].first())
+            .groupby("player_id")[_leadcols].first())
     out = out.join(lead)
 
     def _form(g):
@@ -309,7 +322,7 @@ def main():
         raise SystemExit("Brak plików wejściowych. Podaj kohorta_ALL.csv albo połóż kohorta_*.csv w folderze.")
     print("Pliki wejściowe:", ", ".join(inputs))
     fin, pew = load_status()
-    tmap, cmap = load_name_maps()
+    tmap, cmap, t2c = load_name_maps()
 
     os.makedirs(OUT_DIR, exist_ok=True)
     shutil.rmtree(MATCHES_DIR, ignore_errors=True)
@@ -319,7 +332,7 @@ def main():
     import pyarrow.parquet as pq
 
     print("\n=== ETAP 1: rozdział po skorygowanym roczniku ===")
-    split_inputs(inputs, fin, pew, tmap, cmap)
+    split_inputs(inputs, fin, pew, tmap, cmap, t2c)
     roczniki = sorted(int(d.split("=")[1]) for d in os.listdir(SPLIT_DIR)
                       if d.startswith("rocznik="))
     print(f"\nRoczniki do agregacji: {roczniki}")

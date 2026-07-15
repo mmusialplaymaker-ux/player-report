@@ -28,6 +28,8 @@ import re
 import shutil
 import sys
 
+from collections import Counter, defaultdict
+
 import numpy as np
 import pandas as pd
 
@@ -126,50 +128,55 @@ def load_name_maps(path_base="teamy_kluby_25_26"):
             break
     else:
         print("  (mapa nazw nie znaleziona — nazwy z bazy)")
-        return {}, {}, {}
+        return {}, {}, {}, {}
     try:
         mp = pd.read_excel(path) if path.endswith("xlsx") else _read_flex(path)
     except Exception as e:
         print(f"  (nie wczytano mapy nazw: {e})")
-        return {}, {}, {}
+        return {}, {}, {}, {}
     cols = {str(c).lower().strip(): c for c in mp.columns}
     ti, tn = _pick_pair(cols, "team")
     ci, cn = _pick_pair(cols, "club")
     tmap = _build_map(mp, ti, tn)
     cmap = _build_map(mp, ci, cn)
     t2c = _build_map(mp, ti, cn)      # team_id → nazwa KLUBU (gdy w bazie brak club_id)
+    t2cid = _build_map(mp, ti, ci)    # team_id → club_id (do szukania regionu po klubie)
     print(f"  mapa nazw: plik={path}")
     print(f"    team:  {ti} → {tn}   ({len(tmap)} wpisów)")
     print(f"    club:  {ci} → {cn}   ({len(cmap)} wpisów)")
     print(f"    klub po drużynie: {ti} → {cn}   ({len(t2c)} wpisów)")
     if not tmap and not cmap:
         print(f"    UWAGA: nie wykryto kolumn id/nazwa. Kolumny w pliku: {list(mp.columns)}")
-    return tmap, cmap, t2c
+    return tmap, cmap, t2c, t2cid
 
 
 _TEAM_KEYS = ("team", "druzyn", "drużyn", "zespol", "zespół")
 _CLUB_KEYS = ("club", "klub")
 _NAME_KEYS = ("name", "nazwa")
+_FINAL_KEYS = ("final", "clean", "popraw", "docelow")   # kolumny z wyczyszczonymi nazwami
 
 
 def _pick_pair(cols, kind):
     """(id_col, name_col) dla 'team' albo 'club'. Kolumna musi zawierać rdzeń swojego
-    rodzaju i NIE zawierać rdzenia drugiego — inaczej team_id łapał club_nazwa."""
+    rodzaju i NIE zawierać rdzenia drugiego. Nazwy WYCZYSZCZONE (final_*) mają pierwszeństwo
+    przed surowymi — inaczej brało 'club_name' (MKS MIEDŹ LEGNICA S.A.) zamiast
+    'final_club_name' (Miedź Legnica)."""
     keys = _TEAM_KEYS if kind == "team" else _CLUB_KEYS
     anti = _CLUB_KEYS if kind == "team" else _TEAM_KEYS
 
     def mine(low):
         return any(k in low for k in keys) and not any(a in low for a in anti)
 
-    idc = next((o for low, o in cols.items()
-                if mine(low) and (low.endswith("id") or "_id" in low or "id_" in low)), None)
-    namec = next((o for low, o in cols.items()
-                  if mine(low) and any(n in low for n in _NAME_KEYS)
-                  and not (low.endswith("id") or "_id" in low or "id_" in low)), None)
-    if namec is None:      # np. kolumna nazywa się po prostu „team” / „klub”
-        namec = next((o for low, o in cols.items()
-                      if mine(low) and not (low.endswith("id") or "_id" in low or "id_" in low)), None)
-    return idc, namec
+    def isid(low):
+        return low.endswith("id") or "_id" in low or "id_" in low
+
+    idc = next((o for low, o in cols.items() if mine(low) and isid(low)), None)
+    cands = [(low, o) for low, o in cols.items()
+             if mine(low) and not isid(low) and any(n in low for n in _NAME_KEYS)]
+    if not cands:      # np. kolumna nazywa się po prostu „team” / „klub”
+        cands = [(low, o) for low, o in cols.items() if mine(low) and not isid(low)]
+    cands.sort(key=lambda kv: 0 if any(p in kv[0] for p in _FINAL_KEYS) else 1)
+    return idc, (cands[0][1] if cands else None)
 
 
 def _build_map(mp, idc, namec):
@@ -224,28 +231,73 @@ def _prep_chunk(m, fin, pew, tmap, cmap, t2c):
     return m[m["rocznik_final"].notna()]
 
 
-def split_inputs(inputs, fin, pew, tmap, cmap, t2c):
+def _collect_regions(m, team_reg, club_reg, t2cid):
+    """Zbiera region po drużynie i po klubie. CLJ nie ma regionu — ale ten sam klub
+    gra lokalnie w swoim województwie, więc region bierzemy z dowolnej jego drużyny."""
+    if "region_name" not in m.columns:
+        return
+    r = m[m["region_name"].notna()]
+    if r.empty:
+        return
+    if "team_id" in r.columns:
+        d = r[["team_id", "region_name"]].dropna().drop_duplicates()
+        for tid, reg in zip(d["team_id"].astype(str).str.strip(), d["region_name"]):
+            team_reg.setdefault(tid, reg)
+    cid_ser = None
+    if "club_id" in r.columns and r["club_id"].notna().any():
+        cid_ser = r["club_id"].astype(str).str.strip()
+    if cid_ser is None and t2cid and "team_id" in r.columns:
+        cid_ser = r["team_id"].astype(str).str.strip().map(t2cid)
+    if cid_ser is not None:
+        d = pd.DataFrame({"cid": cid_ser, "reg": r["region_name"]}).dropna()
+        if len(d):
+            for (cid, reg), n in d.groupby(["cid", "reg"]).size().items():
+                club_reg[cid][reg] += int(n)
+
+
+def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid):
     shutil.rmtree(SPLIT_DIR, ignore_errors=True)
     os.makedirs(SPLIT_DIR, exist_ok=True)
     part = 0
+    team_reg, club_reg = {}, defaultdict(Counter)
     for path in inputs:
         enc = _detect_encoding(path)
         print(f"\n→ split {path} (enc={enc})")
         for ci, chunk in enumerate(pd.read_csv(path, encoding=enc, chunksize=CHUNK, low_memory=False)):
             m = _prep_chunk(chunk, fin, pew, tmap, cmap, t2c)
+            _collect_regions(m, team_reg, club_reg, t2cid)
             for Y, sub in m.groupby(m["rocznik_final"].astype(int)):
                 d = os.path.join(SPLIT_DIR, f"rocznik={int(Y)}")
                 os.makedirs(d, exist_ok=True)
                 sub.to_parquet(os.path.join(d, f"part_{part}.parquet"), index=False)
                 part += 1
             print(f"   chunk {ci}: {len(m)} wierszy → roczniki {sorted(m['rocznik_final'].astype(int).unique().tolist())}")
+    club_best = {cid: c.most_common(1)[0][0] for cid, c in club_reg.items() if c}
+    print(f"\n  region: z drużyn {len(team_reg)} | z klubów {len(club_best)}")
+    return team_reg, club_best
 
 
 # ── ETAP 2: agregacja jednego rocznika ───────────────────────────────────────
-def aggregate_rocznik(Y):
+def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None):
     m = pd.read_parquet(os.path.join(SPLIT_DIR, f"rocznik={Y}"))
     m["match_date"] = pd.to_datetime(m["match_date"], errors="coerce")
     m["rocznik_final"] = pd.to_numeric(m["rocznik_final"], errors="coerce")
+
+    # REGION: CLJ nie ma województwa → uzupełnij po drużynie, potem po klubie
+    if "region_name" not in m.columns:
+        m["region_name"] = np.nan
+    if "team_id" in m.columns:
+        miss = m["region_name"].isna()
+        if miss.any() and team_reg:
+            m.loc[miss, "region_name"] = m.loc[miss, "team_id"].astype(str).str.strip().map(team_reg)
+        miss = m["region_name"].isna()
+        if miss.any() and club_reg:
+            cid = (m.loc[miss, "club_id"].astype(str).str.strip()
+                   if "club_id" in m.columns else pd.Series(np.nan, index=m.index[miss]))
+            if t2cid:
+                cid = cid.where(cid.notna() & cid.ne("nan"),
+                                m.loc[miss, "team_id"].astype(str).str.strip().map(t2cid))
+            m.loc[miss, "region_name"] = cid.map(club_reg)
 
     comp = compute_pm_score(m)
     m["_sc"] = comp["score"].values
@@ -322,7 +374,7 @@ def main():
         raise SystemExit("Brak plików wejściowych. Podaj kohorta_ALL.csv albo połóż kohorta_*.csv w folderze.")
     print("Pliki wejściowe:", ", ".join(inputs))
     fin, pew = load_status()
-    tmap, cmap, t2c = load_name_maps()
+    tmap, cmap, t2c, t2cid = load_name_maps()
 
     os.makedirs(OUT_DIR, exist_ok=True)
     shutil.rmtree(MATCHES_DIR, ignore_errors=True)
@@ -332,7 +384,7 @@ def main():
     import pyarrow.parquet as pq
 
     print("\n=== ETAP 1: rozdział po skorygowanym roczniku ===")
-    split_inputs(inputs, fin, pew, tmap, cmap, t2c)
+    team_reg, club_reg = split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid)
     roczniki = sorted(int(d.split("=")[1]) for d in os.listdir(SPLIT_DIR)
                       if d.startswith("rocznik="))
     print(f"\nRoczniki do agregacji: {roczniki}")
@@ -340,7 +392,7 @@ def main():
     print("\n=== ETAP 2: agregacja per rocznik ===")
     all_agg = []
     for Y in roczniki:
-        agg, matches = aggregate_rocznik(Y)
+        agg, matches = aggregate_rocznik(Y, team_reg, club_reg, t2cid)
         all_agg.append(agg)
         matches["rocznik_final"] = matches["rocznik_final"].astype("int64")
         pq.write_to_dataset(pa.Table.from_pandas(matches, preserve_index=False),

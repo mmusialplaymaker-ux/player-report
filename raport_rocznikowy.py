@@ -538,12 +538,13 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
         extras.append((f"{int(r['senior_minutes'])}′ w seniorach", GREEN_D, GREEN, GREEN))
 
     two_rows = len(extras) >= 2
-    h_hero = 0.148 if two_rows else 0.128
+    h_hero = 0.158 if two_rows else 0.132
     _card(fig, X, 0.920 - h_hero, W, h_hero)
-    fig.text(X + 0.025, 0.898, "TWÓJ RAPORT", fontsize=7.5, color=RED, weight="bold")
-    fig.text(X + 0.025, 0.868, _txt(r.get("zawodnik")), fontsize=21, color=TXT, weight="bold")
+    fig.text(X + 0.025, 0.900, "TWÓJ RAPORT", fontsize=7.5, color=RED, weight="bold")
+    fig.text(X + 0.025, 0.872, _txt(r.get("zawodnik")), fontsize=21, color=TXT, weight="bold")
+    fig.text(X + 0.025, 0.847, _txt(r.get("club_name"))[:44], fontsize=9, color=MUTED)
 
-    row1, row2 = 0.831, 0.800
+    row1, row2 = 0.818, 0.788
     cx = _chip(fig, X + 0.025, row1, f"Rocznik {int(year)}")
     cx = _chip(fig, cx, row1, _txt(r.get("region_name")))
     y_chip, xmax = row1, X + 0.470

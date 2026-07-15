@@ -26,6 +26,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 import io
+import math
 import textwrap
 import datetime as _dt
 import matplotlib
@@ -41,6 +42,48 @@ MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "300") or "300"))
 
 AGG_PATH = _secret("PM_AGG", "data/kohorta_agg.parquet")
 MATCHES_DIR = _secret("PM_MATCHES", "data/matches")
+
+
+def _round_nice(n):
+    """Liczebność puli: tysiące → do tysiąca, setki → do setki. 16 600 → 17 000."""
+    n = int(n)
+    if n >= 1000:
+        return int(round(n / 1000.0)) * 1000
+    if n >= 100:
+        return int(round(n / 100.0)) * 100
+    return n
+
+
+def _rank_bucket(rank):
+    """TOP-N dla pozycji > 10. Zaokrąglamy W GÓRĘ — inaczej 'TOP 500' przy 550. miejscu
+    byłoby po prostu nieprawdą. Zwraca None dla miejsc 1–10 (pokazujemy dokładne)."""
+    r = int(rank)
+    if r <= 10:
+        return None
+    if r <= 100:
+        return 100
+    if r < 1000:
+        return int(math.ceil(r / 100.0)) * 100
+    return int(math.ceil(r / 1000.0)) * 1000
+
+
+def _fmt_pl(n):
+    return f"{int(n):,}".replace(",", " ")
+
+
+def pozycja_opis(rank, cohort_n, year):
+    """Jedno zdanie o pozycji — używane w apce i w PDF (żeby nie rozjechały się wzajemnie)."""
+    pula = _fmt_pl(_round_nice(cohort_n))
+    b = _rank_bucket(rank)
+    gdzie = f"{int(rank)}. miejsce" if b is None else f"TOP {_fmt_pl(b)}"
+    return f"{gdzie} na ~{pula} zawodników rocznika {int(year)} w bazie"
+
+
+def pozycja_krotko(rank, cohort_n):
+    """Krótka forma do metryki w apce."""
+    b = _rank_bucket(rank)
+    gdzie = f"{int(rank)}. miejsce" if b is None else f"TOP {_fmt_pl(b)}"
+    return f"{gdzie} / ~{_fmt_pl(_round_nice(cohort_n))}"
 
 
 def _txt(v, default="—"):
@@ -529,9 +572,9 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
     # chipy: rocznik, region + wyróżniki (gra ze starszymi / CLJ / seniorzy)
     extras = []
     if bool(r.get("gra_ze_starszymi")):
-        n = r.get("roczniki_w_gore")
-        lbl = f"Gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "Gra ze starszymi"
-        extras.append((lbl, RED_DIM, RED, RED))
+        # BEZ „+N”: liczba roczników w górę wynika z rocznika szacowanego z wieku,
+        # więc nie jest pewna. Sam fakt gry w starszej kategorii — tak.
+        extras.append(("Gra ze starszymi", RED_DIM, RED, RED))
     if (r.get("clj_minutes") or 0) > 0:
         extras.append((f"{int(r['clj_minutes'])}′ w CLJ", AMBER_D, AMBER, AMBER))
     if (r.get("senior_minutes") or 0) > 0:
@@ -579,14 +622,10 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
     _card(fig, X, 0.470, W, 0.160)
     fig.text(X + 0.025, 0.608, "Gdzie jesteś na tle rocznika?", fontsize=11.5, color=TXT, weight="bold")
     if elig:
-        _rank = int(r['rank_nat'])
-        _rr = _rank if _rank <= 20 else int(round(_rank / 10.0) * 10)
-        _cr = int(round(int(r['cohort_n']) / 100.0) * 100)
-        fig.text(X + 0.025, 0.585, f"Orientacyjnie ≈ {_rr}. miejsce na ~{_cr} "
-                 f"zawodników rocznika {int(year)} w bazie".replace(",", " "),
+        fig.text(X + 0.025, 0.588, "Orientacyjnie " + pozycja_opis(r["rank_nat"], r["cohort_n"], year),
                  fontsize=8.6, color=MUTED)
-        # pasek gradientowy
-        axb = fig.add_axes([X + 0.025, 0.545, W - 0.05, 0.016], zorder=3)
+        # pasek gradientowy (niżej, żeby znacznik TY nie wchodził w tekst nad nim)
+        axb = fig.add_axes([X + 0.025, 0.528, W - 0.05, 0.016], zorder=3)
         grad = np.linspace(0, 1, 256).reshape(1, -1)
         from matplotlib.colors import LinearSegmentedColormap
         cmap = LinearSegmentedColormap.from_list("pm", ["#2A2A30", "#7A1B20", RED])
@@ -597,16 +636,16 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
         p = float(r["pctl"])
         axb.plot([p], [0.5], "o", ms=9, mfc="#FFFFFF", mec="#FFFFFF", clip_on=False, zorder=5)
         xt = X + 0.025 + p * (W - 0.05)
-        _chip(fig, max(X + 0.025, xt - 0.018), 0.575, "TY", fc="#FFFFFF", tc="#111", ec="#FFFFFF",
-              fs=7.5, weight="bold", pad=0.007)
-        fig.text(X + 0.025, 0.532, "Niższy PM Score", fontsize=7, color=MUTED, va="top")
-        fig.text(X + W - 0.025, 0.532, "Wyższy PM Score", fontsize=7, color=MUTED, ha="right", va="top")
-        _card(fig, X + 0.025, 0.482, W - 0.05, 0.040, fc=CARD2, ec=EDGE, r=0.012)
+        _chip(fig, min(max(X + 0.025, xt - 0.018), X + W - 0.065), 0.562, "TY",
+              fc="#FFFFFF", tc="#111", ec="#FFFFFF", fs=7.5, weight="bold", pad=0.007)
+        fig.text(X + 0.025, 0.521, "Niższy PM Score", fontsize=7, color=MUTED, va="top")
+        fig.text(X + W - 0.025, 0.521, "Wyższy PM Score", fontsize=7, color=MUTED, ha="right", va="top")
+        _card(fig, X + 0.025, 0.476, W - 0.05, 0.038, fc=CARD2, ec=EDGE, r=0.012)
         przed = p * 100
         msg = (f"Wyprzedzasz {przed:.0f}% zawodników swojego rocznika w kraju"
                + (f"  ·  TOP {100 - przed:.0f}%." if przed >= 50 else ".")
                + "  Jak rosnąć — patrz strona 2.")
-        fig.text(X + 0.038, 0.502, msg, fontsize=8.4, color=TXT, va="center", zorder=3)
+        fig.text(X + 0.038, 0.495, msg, fontsize=8.4, color=TXT, va="center", zorder=3)
     else:
         fig.text(X + 0.025, 0.560, f"Za mało minut na ranking krajowy "
                  f"({int(r.get('min_total') or 0)} min, próg {min_min} min).",
@@ -880,13 +919,11 @@ def main():
         c1, c2 = st.columns([1, 1.3])
         with c1:
             st.markdown(f"#### {pozycja_txt(float(r['pctl']))}")
-            rank = int(r["rank_nat"])
-            rank_round = rank if rank <= 20 else int(round(rank / 10.0) * 10)
-            cohort_round = int(round(int(r["cohort_n"]) / 100.0) * 100)
             st.metric("Orientacyjna pozycja w roczniku",
-                      f"≈ {rank_round} / ~{cohort_round}",
+                      pozycja_krotko(r["rank_nat"], r["cohort_n"]),
                       help="Pozycja i liczebność są przybliżone — pula rówieśników jest szacowana "
-                           "z wieku skorygowanego historią lig, nie ze spisu.")
+                           "z wieku skorygowanego historią lig, nie ze spisu. "
+                           "TOP-N zaokrąglamy w górę, żeby nie zawyżać.")
             st.plotly_chart(gfig, use_container_width=True, config=PLOTLY_CFG)
         with c2:
             st.markdown("#### Gdzie jesteś na tle rocznika")
@@ -895,9 +932,7 @@ def main():
 
     badges = []
     if bool(r.get("gra_ze_starszymi")):
-        n = r.get("roczniki_w_gore")
-        lbl = f"⚡ Gra ze starszymi (+{int(n)})" if pd.notna(n) and n >= 1 else "⚡ Gra ze starszymi"
-        badges.append((lbl, "#E8232A"))
+        badges.append(("⚡ Gra ze starszymi", "#E8232A"))
     if (r.get("clj_minutes") or 0) > 0:
         badges.append((f"🏅 {int(r['clj_minutes'])}′ w CLJ", "#F0B429"))
     if (r.get("senior_minutes") or 0) > 0:

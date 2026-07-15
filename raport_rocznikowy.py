@@ -86,6 +86,15 @@ def pozycja_krotko(rank, cohort_n):
     return f"{gdzie} / ~{_fmt_pl(_round_nice(cohort_n))}"
 
 
+def _num(v, default=0.0):
+    """Bezpieczna liczba: NaN/None/tekst → default."""
+    try:
+        f = float(v)
+        return default if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
 def _txt(v, default="—"):
     """Bezpieczny tekst do wyświetlenia. UWAGA: NaN jest w Pythonie 'truthy',
     więc `x or '—'` przepuszcza NaN i renderuje literalne 'nan' — stąd ten helper."""
@@ -312,9 +321,9 @@ def rekomendacja(r, min_min):
     if pd.notna(pctl) and pctl >= 0.95 and (sen > 0 or clj > 0):
         gdzie = []
         if clj > 0:
-            gdzie.append(f"{int(clj)}′ w CLJ")
+            gdzie.append("grasz w CLJ")
         if sen > 0:
-            gdzie.append(f"{int(sen)}′ w seniorach")
+            gdzie.append("masz minuty w seniorach")
         return ("Jesteś w krajowej czołówce rocznika — utrzymaj kierunek", [
             f"Wyprzedzasz {pctl * 100:.0f}% rocznika w Polsce ({', '.join(gdzie)}).",
             "Priorytet: regularne minuty na najwyższym dostępnym poziomie, nie zmiana klubu.",
@@ -575,10 +584,10 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
         # BEZ „+N”: liczba roczników w górę wynika z rocznika szacowanego z wieku,
         # więc nie jest pewna. Sam fakt gry w starszej kategorii — tak.
         extras.append(("Gra ze starszymi", RED_DIM, RED, RED))
-    if (r.get("clj_minutes") or 0) > 0:
-        extras.append((f"{int(r['clj_minutes'])}′ w CLJ", AMBER_D, AMBER, AMBER))
-    if (r.get("senior_minutes") or 0) > 0:
-        extras.append((f"{int(r['senior_minutes'])}′ w seniorach", GREEN_D, GREEN, GREEN))
+    if _num(r.get("clj_minutes")) > 0:
+        extras.append(("Minuty w CLJ", AMBER_D, AMBER, AMBER))
+    if _num(r.get("senior_minutes")) > 0:
+        extras.append(("Minuty w seniorach", GREEN_D, GREEN, GREEN))
 
     two_rows = len(extras) >= 2
     h_hero = 0.158 if two_rows else 0.132
@@ -899,6 +908,16 @@ def main():
     pid = str(req["player_id"])
     r = df[df["player_id"] == pid].iloc[0]
     trend = load_player_matches(pid, req.get("rocznik_final"))
+
+    # „Gra ze starszymi” liczymy wobec ROCZNIKA ZE ZGŁOSZENIA (pewnego), a nie wobec
+    # rocznika szacowanego z wieku — inaczej zawodnik grający własną kategorię dostaje
+    # ten znacznik fałszywie, gdy w bazie ma zaniżony rocznik.
+    if len(trend) and "league_name" in trend.columns:
+        _maxy = _cat_maxyear_series(trend)
+        _mn = pd.to_numeric(trend.get("minutes"), errors="coerce").fillna(0)
+        _up = (_mn > 0) & _maxy.notna() & (int(year) > _maxy)
+        r = r.copy()
+        r["gra_ze_starszymi"] = bool(_up.any())
 
     st.markdown(f"### {r['zawodnik']}")
     st.markdown(

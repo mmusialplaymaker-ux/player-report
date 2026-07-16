@@ -5,3 +5,13 @@ __pycache__/
 kohorta_ALL.csv
 kohorta_*.csv
 data/_split/
+
+rocznik_historia.csv
+kohorta_ALL.xlsx
+kohorta_agg.csv.gz
+kohorta_trend.csv.gz
+
+rocznik_historia.csv
+kohorta_ALL.xlsx
+kohorta_agg.csv.gz
+kohorta_trend.csv.gz

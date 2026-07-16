@@ -71,6 +71,28 @@ def _collect_female_ids(m, female_ids):
 
 SZCZEBEL_NAZWA = {5: "CLJ / Makroregionalna", 4: "I liga wojewódzka", 3: "II liga wojewódzka",
                   2: "III liga wojewódzka", 1: "liga okręgowa", 0: "—"}
+
+# Ta sama liga bywa w bazie zapisana osobno dla rundy jesiennej i wiosennej — najczęściej
+# przez sufiks „(RW)”. W raporcie to jedne rozgrywki, więc znaczniki rundy usuwamy.
+# UWAGA: NIE scalamy nazw grup („podgrupa II” vs „grupa mistrzowska”) — po rundzie jesiennej
+# zespoły są przegrupowane, więc to naprawdę różne rozgrywki.
+_ROUND_PATS = [
+    r"\s*\((?:RW|RJ)\)",                                        # (RW) = runda wiosenna
+    r'\s*"\s*(?:runda\s+)?(?:jesienna|wiosenna|jesień|wiosna)\s*"',   # cały cudzysłów = sama runda
+    r"\s*[-–]\s*(?:jesień|wiosna|jesienna|wiosenna)(?:\s*20\d\d)?\b",
+    r"\s*\[\s*(?:jesień|wiosna)\s*\]",
+]
+
+
+def _norm_play(name):
+    """Nazwa rozgrywek bez znacznika rundy (jesień/wiosna scalone w jedno)."""
+    s = str(name)
+    if not s or s.lower() == "nan":
+        return name
+    for p in _ROUND_PATS:
+        s = re.sub(p, "", s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*""\s*', " ", s)          # pusty cudzysłów po usunięciu rundy
+    return " ".join(s.split()).strip()
 _ROMAN = {"i": 1, "ii": 2, "iii": 3}
 _WOJ = ("małopolsk", "śląsk", "świętokrzysk", "dolnośląsk", "wielkopolsk", "pomorsk", "mazowieck",
         "lubelsk", "podkarpack", "kujawsko", "warmińsko", "zachodniopomorsk", "lubusk", "łódzk",
@@ -311,6 +333,8 @@ def _prep_chunk(m, fin, pew, tmap, cmap, t2c, man_id, man_name):
     m = _coerce(m)
     m = m[~m["firstname"].map(_is_female)].copy()
     m["zawodnik"] = (m["firstname"].fillna("") + " " + m["lastname"].fillna("")).str.strip()
+    if "play_name" in m.columns:          # scal rundę jesienną z wiosenną
+        m["play_name"] = m["play_name"].map(_norm_play)
     if "club_id" in m.columns:
         m["club_name"] = _resolve(m["club_id"], m.get("club_name"), cmap)
     if "team_id" in m.columns:
@@ -477,6 +501,12 @@ def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None, female_ids=No
     out["kategoria_glowna"] = (m.assign(_w=mn).groupby(["player_id", "league_name"])["_w"].sum()
                                .reset_index().sort_values("_w", ascending=False)
                                .groupby("player_id")["league_name"].first().reindex(out.index))
+    if "play_name" in m.columns:
+        out["play_glowna"] = (m.assign(_w=mn).groupby(["player_id", "play_name"])["_w"].sum()
+                              .reset_index().sort_values("_w", ascending=False)
+                              .groupby("player_id")["play_name"].first().reindex(out.index))
+    else:
+        out["play_glowna"] = np.nan
     sz = (m[m["_szcz"] > 0].assign(_w=mn[m["_szcz"] > 0]).groupby(["player_id", "_szcz"])["_w"].sum()
           .reset_index().sort_values("_w", ascending=False).groupby("player_id").first())
     out["szczebel"] = sz["_szcz"].reindex(out.index).fillna(0).astype(int)

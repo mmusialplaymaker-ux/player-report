@@ -39,9 +39,10 @@ from app import compute_pm_score, _coerce, _cat_maxyear_series, _secret
 CURRENT_SEASON = _secret("PM_SEASON_ID", "e9d66181-d03e-4bb3-b889-4da848f4831d")
 DATA_MODE = (_secret("PM_DATA_MODE", "csv") or "csv").lower()
 MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "1000") or "1000"))
-# Najmłodszy rocznik w ofercie. Dla młodszych (2012+) nie ma CLJ, więc ranking jest
-# zdominowany przez dzieci grające w górę w klubach bez odpowiedniej kategorii.
-MAX_ROCZNIK = int(float(_secret("PM_MAX_ROCZNIK", "2011") or "2011"))
+# Najmłodszy rocznik w ofercie (sekret PM_MAX_ROCZNIK — da się zmienić bez deployu).
+# Im młodszy rocznik, tym mniej rozgrywek centralnych, więc ranking jest bardziej
+# wrażliwy na dzieci grające w górę w klubach bez odpowiedniej kategorii.
+MAX_ROCZNIK = int(float(_secret("PM_MAX_ROCZNIK", "2012") or "2012"))
 
 AGG_PATH = _secret("PM_AGG", "data/kohorta_agg.parquet")
 MATCHES_DIR = _secret("PM_MATCHES", "data/matches")
@@ -79,7 +80,7 @@ def pozycja_opis(rank, cohort_n, year):
     pula = _fmt_pl(_round_nice(cohort_n))
     b = _rank_bucket(rank)
     gdzie = f"{int(rank)}. miejsce" if b is None else f"TOP {_fmt_pl(b)}"
-    return f"{gdzie} na ~{pula} zawodników rocznika {int(year)} w bazie"
+    return f"{gdzie} na ~{pula} zawodników rocznika {int(year)}"
 
 
 def pozycja_krotko(rank, cohort_n):
@@ -96,6 +97,49 @@ def _num(v, default=0.0):
         return default if pd.isna(f) else f
     except (TypeError, ValueError):
         return default
+
+
+def pozycja_w_grupie_opis(rank, n):
+    """Pozycja w lidze/kategorii — ZAWSZE dokładnie. W przeciwieństwie do rocznika (gdzie pula
+    jest szacowana) tu wiemy dokładnie, kto gra w tych rozgrywkach, więc nie ma czego zaokrąglać."""
+    return f"{int(rank)}. miejsce na {_fmt_pl(n)}"
+
+
+def pozycja_w_grupie(agg, r, col, min_min, min_n=15):
+    """Pozycja zawodnika wśród WSZYSTKICH (każdy rocznik), dla których ta sama kategoria
+    (league_name) albo liga (play_name) jest główna. Miejsce liczymy wśród grających
+    regularnie (min_min), ale mianownik to CAŁA grupa — bo tak to komunikujemy."""
+    if col not in agg.columns:
+        return None
+    key = r.get(col)
+    if key is None or (isinstance(key, float) and pd.isna(key)) or not str(key).strip():
+        return None
+    g_all = agg[agg[col].astype(str) == str(key)].copy()
+    g_all["pm_score"] = pd.to_numeric(g_all["pm_score"], errors="coerce")
+    g_all["min_total"] = pd.to_numeric(g_all["min_total"], errors="coerce")
+    n_all = int(len(g_all))
+    g = g_all[(g_all["min_total"].fillna(0) >= min_min) & g_all["pm_score"].notna()]
+    if len(g) < min_n:
+        return None
+    if str(r["player_id"]) not in set(g["player_id"].astype(str)):
+        rr = r.copy()
+        g = pd.concat([g, rr.to_frame().T], ignore_index=True)
+        g["pm_score"] = pd.to_numeric(g["pm_score"], errors="coerce")
+        n_all += 1
+    g["_rank"] = g["pm_score"].rank(ascending=False, method="min")
+    me = g[g["player_id"].astype(str) == str(r["player_id"])]
+    if not len(me):
+        return None
+    rank = int(me["_rank"].iloc[0])
+    top = g.sort_values("pm_score", ascending=False).head(10)
+    return {"nazwa": str(key), "pctl": float(max(0.0, min(1.0, 1.0 - (rank - 1) / max(n_all, 1)))),
+            "rank": rank, "n": n_all,
+            "top": [[i + 1, str(t.zawodnik), float(t.pm_score)]
+                    for i, t in enumerate(top.itertuples())]}
+
+
+def _norm_txt(v):
+    return " ".join(str(v).strip().lower().split())
 
 
 def _txt(v, default="—"):
@@ -255,14 +299,18 @@ def build_cohort(m):
 
 
 def apply_percentiles(base, min_min):
-    """Percentyle i rank liczone TYLKO wśród zawodników z wiarygodną próbą (min_min)."""
+    """Pozycję liczymy wśród zawodników z wiarygodną próbą (min_min), ale ODNOSIMY ją do
+    CAŁEGO rocznika — bo tak ją komunikujemy. Zawodnicy poniżej progu nie mają dość minut,
+    by przypisać im miejsce, więc w tej skali są poniżej sklasyfikowanych."""
     df = base.copy()
     elig = df["min_total"].fillna(0) >= min_min
     df["eligible"] = elig
     sub = df[elig]
-    df.loc[elig, "pctl"] = sub["pm_score"].rank(pct=True)
-    df.loc[elig, "rank_nat"] = sub["pm_score"].rank(ascending=False, method="min")
-    df["cohort_n"] = int(elig.sum())
+    n_all = max(int(len(df)), 1)
+    df["cohort_n"] = n_all
+    rank = sub["pm_score"].rank(ascending=False, method="min")
+    df.loc[elig, "rank_nat"] = rank
+    df.loc[elig, "pctl"] = (1.0 - (rank - 1) / n_all).clip(lower=0.0, upper=1.0)
     src = {"Jakość gry": "pm_quality", "Skuteczność": "gole_per90",
            "Regularność gry": "min_total", "Równość formy": "kons"}
     for lbl, col in src.items():
@@ -363,10 +411,11 @@ def rekomendacja(r, min_min):
 
 
 def pozycja_txt(pctl):
-    """Uczciwy opis pozycji: bez mylącego 'TOP 88%'."""
+    """Uczciwy opis pozycji: bez mylącego 'TOP 88%' i bez 'TOP 0%' dla lidera."""
     przed = pctl * 100
-    if przed >= 50:
-        return f"Wyprzedzasz {przed:.0f}% rocznika  ·  TOP {100 - przed:.0f}%"
+    top_pct = 100 - przed
+    if przed >= 50 and top_pct >= 1:
+        return f"Wyprzedzasz {przed:.0f}% rocznika  ·  TOP {top_pct:.0f}%"
     return f"Wyprzedzasz {przed:.0f}% rocznika w Polsce"
 
 
@@ -458,10 +507,12 @@ def wystepy_per_play(g):
     return per
 
 
-def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min):
-    """PDF w ciemnym stylu PlayMaker: str.1 = raport, str.2 = sezon + mecze, str.3+ = reszta meczów."""
-    figs = [_pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min),
-            _pdf_page2(r, pm_rows, year, min_min)]
+def build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min, kat=None, play=None):
+    """PDF: str.1 = rocznik, str.2 = kategoria + liga, str.3 = sezon + mecze, str.4+ = mecze."""
+    figs = [_pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min)]
+    if kat or play:
+        figs.append(_pdf_page_ligi(r, kat, play, year, min_min))
+    figs.append(_pdf_page2(r, pm_rows, year, min_min))
     if pm_rows is not None and len(pm_rows) > MATCH_ROWS_P2:
         rest = pm_rows.sort_values("match_date").iloc[MATCH_ROWS_P2:]
         part = 1
@@ -654,9 +705,10 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
         fig.text(X + W - 0.025, 0.521, "Wyższy PM Score", fontsize=7, color=MUTED, ha="right", va="top")
         _card(fig, X + 0.025, 0.476, W - 0.05, 0.038, fc=CARD2, ec=EDGE, r=0.012)
         przed = p * 100
+        top_pct = 100 - przed
         msg = (f"Wyprzedzasz {przed:.0f}% zawodników swojego rocznika w kraju"
-               + (f"  ·  TOP {100 - przed:.0f}%." if przed >= 50 else ".")
-               + "  Jak rosnąć — patrz strona 2.")
+               + (f"  ·  TOP {top_pct:.0f}%." if przed >= 50 and top_pct >= 1 else ".")
+               + "  Jak rosnąć — patrz dalej.")
         fig.text(X + 0.038, 0.495, msg, fontsize=8.4, color=TXT, va="center", zorder=3)
     else:
         fig.text(X + 0.025, 0.560, f"Za mało minut na ranking krajowy "
@@ -679,10 +731,87 @@ def _pdf_page1(r, top_pdf, dist_scores, pm_rows, year, min_min):
                  color=TXT, weight="bold" if mine else "normal", va="center", zorder=3)
         fig.text(X + W - 0.042, y0 - i * rh + 0.014, f"{float(sc) * 100:.0f}", fontsize=9.5,
                  color=RED, weight="bold", ha="right", va="center", zorder=3)
+    _pdf_footer(fig, X, min_min)      # nota o roczniku dotyczy właśnie tej strony
     return fig
 
 
 # ── STRONA 2 ─────────────────────────────────────────────────────────────────
+def _rank_card(fig, X, W, y_bot, h, naglowek, grupa, r, col=RED, col_dark="#7A1B20", col_hl="#2A1416"):
+    """Karta rankingowa: tytul + pozycja + pasek z TY + Top 10 (rozgrywki albo liga).
+    Kolor odróżnia trzy rankingi: czerwony rocznik, zielony rozgrywki, żółty liga."""
+    _card(fig, X, y_bot, W, h)
+    top_y = y_bot + h
+    fig.text(X + 0.025, top_y - 0.026, naglowek, fontsize=7.5, color=col, weight="bold")
+    fig.text(X + 0.025, top_y - 0.054, _txt(grupa["nazwa"])[:54], fontsize=12.5,
+             color=TXT, weight="bold")
+    fig.text(X + 0.025, top_y - 0.076,
+             pozycja_w_grupie_opis(grupa["rank"], grupa["n"]) + " zawodników",
+             fontsize=8, color=MUTED)
+
+    by = top_y - 0.124
+    axb = fig.add_axes([X + 0.025, by, W - 0.05, 0.014], zorder=3)
+    grad = np.linspace(0, 1, 256).reshape(1, -1)
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("pm", ["#2A2A30", col_dark, col])
+    axb.imshow(grad, aspect="auto", cmap=cmap, extent=[0, 1, 0, 1])
+    axb.set_xticks([])
+    axb.set_yticks([])
+    axb.set_facecolor(BG)
+    for sp in axb.spines.values():
+        sp.set_visible(False)
+    p = float(grupa["pctl"])
+    axb.plot([p], [0.5], "o", ms=8, mfc="#FFFFFF", mec="#FFFFFF", clip_on=False, zorder=5)
+    xt = X + 0.025 + p * (W - 0.05)
+    _chip(fig, min(max(X + 0.025, xt - 0.018), X + W - 0.065), by + 0.030, "TY",
+          fc="#FFFFFF", tc="#111", ec="#FFFFFF", fs=7, weight="bold", pad=0.006)
+    fig.text(X + 0.025, by - 0.010,
+             "Wyprzedzasz {:.0f}% zawodników tych rozgrywek".format(p * 100),
+             fontsize=7.5, color=TXT, va="top")
+
+    ty = by - 0.038
+    fig.text(X + 0.025, ty, "Top 10", fontsize=8.5, color=TXT, weight="bold", va="top")
+    fig.text(X + W - 0.025, ty, "PM Score", fontsize=6.8, color=MUTED, ha="right", va="top")
+    me = _norm_txt(r.get("zawodnik"))
+    yy = ty - 0.028
+    for poz, nazwa, sc in grupa["top"][:10]:
+        mine = _norm_txt(nazwa) == me
+        if mine:
+            _card(fig, X + 0.022, yy - 0.0085, W - 0.044, 0.020, fc=col_hl, ec=col, r=0.006)
+        fig.text(X + 0.036, yy, str(poz), fontsize=7, color=col if mine else MUTED,
+                 weight="bold", va="center", zorder=3)
+        fig.text(X + 0.060, yy, str(nazwa)[:38], fontsize=7.8,
+                 color=TXT if mine else "#D9D9DE", va="center", zorder=3)
+        fig.text(X + W - 0.036, yy, "{:.0f}".format(sc * 100), fontsize=7.8,
+                 color=col if mine else MUTED, weight="bold", ha="right", va="center", zorder=3)
+        yy -= 0.0215
+
+
+def _pdf_page_ligi(r, kat, play, year, min_min):
+    """Strona 2: pozycja na tle wlasnej kategorii i wlasnej ligi."""
+    fig = plt.figure(figsize=(8.27, 11.69), facecolor=BG)
+    X, W = 0.09, 0.82
+    _logo(fig, X, 0.945)
+    fig.text(X + W, 0.947, "{}  ·  rocznik {}".format(_txt(r.get("zawodnik")), int(year)),
+             fontsize=8.5, color=MUTED, ha="right", weight="bold")
+    fig.text(X, 0.903, "Gdzie jesteś w swoich rozgrywkach?", fontsize=15,
+             color=TXT, weight="bold")
+    fig.text(X, 0.882, "Ranking rocznikowy porównuje Cię z rówieśnikami z całej Polski.",
+             fontsize=8.2, color=MUTED)
+    fig.text(X, 0.866, "Tutaj porównujemy Cię z tymi, z którymi realnie grasz.",
+             fontsize=8.2, color=MUTED)
+    if kat:
+        _rank_card(fig, X, W, 0.462, 0.400, "TWOJE ROZGRYWKI", kat, r,
+                   col=GREEN, col_dark="#12452E", col_hl="#0E2A1D")
+    if play:
+        _rank_card(fig, X, W, 0.045, 0.400, "TWOJA LIGA", play, r,
+                   col=AMBER, col_dark="#6B4E10", col_hl="#2B2210")
+    if not kat and not play:
+        fig.text(X, 0.60, "Za mało danych porównawczych w Twoich rozgrywkach.",
+                 fontsize=9, color=MUTED)
+    _pdf_footer(fig, X, min_min)          # bez legendy W/R/P — na tej stronie nie ma meczów
+    return fig
+
+
 def _pdf_page2(r, pm_rows, year, min_min):
     fig = _dark_fig()
     X, W = 0.09, 0.82
@@ -761,7 +890,7 @@ def _pdf_page2(r, pm_rows, year, min_min):
         _pdf_footer(fig, X, min_min)
         return fig
     _match_rows(fig, X, W, g.iloc[:MATCH_ROWS_P2], y0=0.262)
-    _pdf_footer(fig, X, min_min)
+    _pdf_footer(fig, X, min_min, mecze=True)
     return fig
 
 
@@ -800,12 +929,15 @@ def _match_rows(fig, X, W, rows, y0):
                  ha="right", va="center", zorder=3)
 
 
-def _pdf_footer(fig, X, min_min):
-    fig.text(X, 0.030, "W = wygrana · R = remis · P = porażka · Kartki = żółte + czerwone",
-             fontsize=6.8, color=MUTED)
-    fig.text(X, 0.018, f"Rocznik szacowany z wieku podanego w źródłach publicznych, potwierdzany historią gry "
-             f"w kategoriach. Pozycja i liczebność rocznika orientacyjne (pula śledzona z min. {min_min} min, "
-             f"nie pełny spis Polski). Wygenerowano {_dt.date.today():%d.%m.%Y}.",
+def _pdf_footer(fig, X, min_min, mecze=False):
+    """Stopka. Legenda W/R/P tylko na stronach, gdzie faktycznie są mecze.
+    Nota o roczniku zawijana, bo w jednej linii wyjeżdżała poza stronę."""
+    y = 0.030
+    if mecze:
+        fig.text(X, y, "W = wygrana · R = remis · P = porażka · Kartki = żółte + czerwone",
+                 fontsize=6.8, color=MUTED)
+        y -= 0.012
+    fig.text(X, y, f"Pozycja i liczebność przybliżona. Wygenerowano {_dt.date.today():%d.%m.%Y}.",
              fontsize=6.2, color=MUTED)
 
 
@@ -820,7 +952,7 @@ def _pdf_matches_page(r, rows, year, min_min, part):
     fig.text(X + 0.025, 0.873, f"Wszystkie mecze sezonu (cd. {part})", fontsize=11.5,
              color=TXT, weight="bold")
     _match_rows(fig, X, W, rows, y0=0.828)
-    _pdf_footer(fig, X, min_min)
+    _pdf_footer(fig, X, min_min, mecze=True)
     return fig
 
 def check_password():
@@ -931,10 +1063,9 @@ def main():
         f"<span style='color:#8B8B93'>Rocznik {int(year)} (ze zgłoszenia) · "
         f"{_txt(r.get('club_name'))} · {_txt(r.get('region_name'))}</span>",
         unsafe_allow_html=True)
-    st.caption(f"Pula rówieśników: **~{n_all}** zawodników rocznika {int(year)} w bazie — "
-               f"wiek z danych publicznych, skorygowany historią gry w kategoriach; "
-               f"**{n_elig}** z min. {min_min} min. To pula śledzona, nie pełny spis Polski, "
-               f"więc pozycję podajemy orientacyjnie.")
+    st.caption(f"Rocznik {int(year)}: **{n_all}** zawodników w bazie. Miejsce liczymy wśród "
+               f"**{n_elig}** z min. {min_min} min (reszta ma za małą próbę), ale odnosimy je "
+               f"do całego rocznika. Pozycja i liczebność przybliżone.")
 
     if not r["eligible"]:
         st.info(f"⚠️ Za mało minut na wiarygodną ocenę w skali kraju "
@@ -1090,13 +1221,43 @@ def main():
     st.dataframe(top10.style.apply(_hl, axis=1), hide_index=True, use_container_width=True)
 
     st.divider()
+
+    # ── POZYCJA W SWOICH ROZGRYWKACH (kategoria + liga) ──────────────────────
+    kat = pozycja_w_grupie(agg, r, "kategoria_glowna", min_min) if r["eligible"] else None
+    play = pozycja_w_grupie(agg, r, "play_glowna", min_min) if r["eligible"] else None
+    if kat or play:
+        st.markdown("#### Gdzie jeste\u015b w swoich rozgrywkach")
+        st.caption("Ranking rocznikowy por\u00f3wnuje z r\u00f3wie\u015bnikami z ca\u0142ej "
+                   "Polski. Tutaj \u2014 z tymi, z kt\u00f3rymi realnie grasz "
+                   f"(pr\u00f3g {min_min} min, wszystkie roczniki).")
+        gc = st.columns(2)
+        for c, g, tyt in ((gc[0], kat, "Twoje rozgrywki"), (gc[1], play, "Twoja liga")):
+            with c:
+                if not g:
+                    st.caption(f"{tyt}: za ma\u0142o danych por\u00f3wnawczych.")
+                    continue
+                st.markdown(f"**{tyt}:** {_txt(g['nazwa'])}")
+                st.metric("Pozycja", pozycja_w_grupie_opis(g["rank"], g["n"]),
+                          help="W\u015br\u00f3d zawodnik\u00f3w, dla kt\u00f3rych to "
+                               "g\u0142\u00f3wne rozgrywki (ka\u017cdy rocznik).")
+                st.progress(min(max(float(g["pctl"]), 0.0), 1.0),
+                            text=f"Wyprzedzasz {g['pctl'] * 100:.0f}%")
+                t = pd.DataFrame(g["top"], columns=["#", "Zawodnik", "PM Score"])
+                t["PM Score"] = t["PM Score"].round(3)
+                st.dataframe(t.style.apply(
+                    lambda row: ["background-color:#1c3a4a"
+                                 if _norm_txt(row["Zawodnik"]) == _norm_txt(r["zawodnik"]) else ""
+                                 for _ in row], axis=1),
+                    hide_index=True, use_container_width=True)
+        st.divider()
+
     st.markdown("#### Raport PDF dla zawodnika")
     top_pdf = (df[df["eligible"]].sort_values("pm_score", ascending=False).head(10)
                [["rank_nat", "zawodnik", "pm_score"]].values.tolist())
     pm_rows = trend[trend["player_id"] == pid] if trend is not None and not trend.empty else pd.DataFrame()
     dist_scores = df.loc[df["eligible"], "pm_score"].to_numpy()
     try:
-        pdf_bytes = build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min)
+        pdf_bytes = build_pdf(r, top_pdf, pm_rows, dist_scores, year, min_min, kat, play)
         safe = "".join(ch if ch.isalnum() else "_" for ch in str(r["zawodnik"])).strip("_")
         st.download_button("⬇️ Pobierz PDF zawodnika", pdf_bytes,
                            file_name=f"raport_{safe}_{int(year)}.pdf", mime="application/pdf")

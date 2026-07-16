@@ -115,11 +115,13 @@ dist = np.clip(np.random.default_rng(9).beta(2.4, 4.6, 16563) * 0.95, 0, 1)
 
 # ── Twoje rozgrywki (CLJ U-17) i Twoja liga (grupa A) ───────────────────────
 kn = nazwiska(10, 21)
+KLUBY = ["Legia Warszawa", "Lech Poznań", "Wisła Kraków", "Pogoń Szczecin", "Raków Częstochowa",
+         "Górnik Zabrze", "Jagiellonia Białystok", "Zagłębie Lubin", "Śląsk Wrocław", "Cracovia"]
 kat = {"nazwa": "CLJ U-17", "pctl": 0.86, "rank": 63, "n": 1280,   # 4 grupy x 16 zespołów x 20
-       "top": [[i + 1, kn[i], round(0.71 - i * 0.009, 3)] for i in range(10)]}
+       "top": [[i + 1, kn[i], round(0.71 - i * 0.009, 3), KLUBY[i]] for i in range(10)]}
 pn = nazwiska(9, 33)
-play_top = [[i + 1, pn[i], round(0.69 - i * 0.010, 3)] for i in range(9)]
-play_top.insert(3, [4, ZAWODNIK, 0.641])
+play_top = [[i + 1, pn[i], round(0.69 - i * 0.010, 3), KLUBY[i]] for i in range(9)]
+play_top.insert(3, [4, ZAWODNIK, 0.641, KLUB])
 for i, row in enumerate(play_top):
     row[0] = i + 1
 play = {"nazwa": 'CLJ U-17 "Grupa A"', "pctl": 0.94, "rank": 4, "n": 320,   # 16 zespołów x 20

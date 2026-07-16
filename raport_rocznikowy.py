@@ -134,7 +134,7 @@ def pozycja_w_grupie(agg, r, col, min_min, min_n=15):
     top = g.sort_values("pm_score", ascending=False).head(10)
     return {"nazwa": str(key), "pctl": float(max(0.0, min(1.0, 1.0 - (rank - 1) / max(n_all, 1)))),
             "rank": rank, "n": n_all,
-            "top": [[i + 1, str(t.zawodnik), float(t.pm_score)]
+            "top": [[i + 1, str(t.zawodnik), float(t.pm_score), _txt(getattr(t, "club_name", None))]
                     for i, t in enumerate(top.itertuples())]}
 
 
@@ -773,7 +773,7 @@ def _rank_card(fig, X, W, y_bot, h, naglowek, grupa, r, col=RED, col_dark="#7A1B
     fig.text(X + W - 0.025, ty, "PM Score", fontsize=6.8, color=MUTED, ha="right", va="top")
     me = _norm_txt(r.get("zawodnik"))
     yy = ty - 0.028
-    for poz, nazwa, sc in grupa["top"][:10]:
+    for poz, nazwa, sc, _klub in grupa["top"][:10]:      # klub używa apka, PDF go nie pokazuje
         mine = _norm_txt(nazwa) == me
         if mine:
             _card(fig, X + 0.022, yy - 0.0085, W - 0.044, 0.020, fc=col_hl, ec=col, r=0.006)
@@ -1226,29 +1226,29 @@ def main():
     kat = pozycja_w_grupie(agg, r, "kategoria_glowna", min_min) if r["eligible"] else None
     play = pozycja_w_grupie(agg, r, "play_glowna", min_min) if r["eligible"] else None
     if kat or play:
-        st.markdown("#### Gdzie jeste\u015b w swoich rozgrywkach")
-        st.caption("Ranking rocznikowy por\u00f3wnuje z r\u00f3wie\u015bnikami z ca\u0142ej "
-                   "Polski. Tutaj \u2014 z tymi, z kt\u00f3rymi realnie grasz "
-                   f"(pr\u00f3g {min_min} min, wszystkie roczniki).")
-        gc = st.columns(2)
-        for c, g, tyt in ((gc[0], kat, "Twoje rozgrywki"), (gc[1], play, "Twoja liga")):
-            with c:
-                if not g:
-                    st.caption(f"{tyt}: za ma\u0142o danych por\u00f3wnawczych.")
-                    continue
-                st.markdown(f"**{tyt}:** {_txt(g['nazwa'])}")
-                st.metric("Pozycja", pozycja_w_grupie_opis(g["rank"], g["n"]),
-                          help="W\u015br\u00f3d zawodnik\u00f3w, dla kt\u00f3rych to "
-                               "g\u0142\u00f3wne rozgrywki (ka\u017cdy rocznik).")
+        st.markdown("#### Gdzie jesteś w swoich rozgrywkach")
+        st.caption("Ranking rocznikowy porównuje z rówieśnikami z całej Polski. "
+                   "Tutaj — z tymi, z którymi realnie grasz (wszystkie roczniki).")
+        for g, tyt in ((kat, "Twoje rozgrywki"), (play, "Twoja liga")):
+            if not g:
+                st.caption(f"{tyt}: za mało danych porównawczych.")
+                continue
+            st.markdown(f"##### {tyt}: {_txt(g['nazwa'])}")
+            mc = st.columns([1, 2])
+            mc[0].metric("Pozycja", pozycja_w_grupie_opis(g["rank"], g["n"]),
+                         help="Wśród wszystkich zawodników tych rozgrywek (każdy rocznik). "
+                              f"Miejsce liczone wśród grających min. {min_min} min.")
+            with mc[1]:
                 st.progress(min(max(float(g["pctl"]), 0.0), 1.0),
-                            text=f"Wyprzedzasz {g['pctl'] * 100:.0f}%")
-                t = pd.DataFrame(g["top"], columns=["#", "Zawodnik", "PM Score"])
-                t["PM Score"] = t["PM Score"].round(3)
-                st.dataframe(t.style.apply(
-                    lambda row: ["background-color:#1c3a4a"
-                                 if _norm_txt(row["Zawodnik"]) == _norm_txt(r["zawodnik"]) else ""
-                                 for _ in row], axis=1),
-                    hide_index=True, use_container_width=True)
+                            text=f"Wyprzedzasz {g['pctl'] * 100:.0f}% zawodników tych rozgrywek")
+            t = pd.DataFrame(g["top"], columns=["#", "Zawodnik", "PM Score", "Klub"])
+            t = t[["#", "Zawodnik", "Klub", "PM Score"]]
+            t["PM Score"] = t["PM Score"].round(3)
+            st.dataframe(t.style.apply(
+                lambda row: ["background-color:#1c3a4a"
+                             if _norm_txt(row["Zawodnik"]) == _norm_txt(r["zawodnik"]) else ""
+                             for _ in row], axis=1),
+                hide_index=True, use_container_width=True)
         st.divider()
 
     st.markdown("#### Raport PDF dla zawodnika")

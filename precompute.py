@@ -375,6 +375,33 @@ def _prep_chunk(m, fin, pew, tmap, cmap, t2c, man_id, man_name):
     return m[m["rocznik_final"].notna()]
 
 
+def _collect_play_regions(m, play_reg):
+    """play_id -> region ROZGRYWEK, liczony z SUROWEGO region_name (przed uzupełnianiem
+    z klubu w agregacji). Każde play_id ma dokładnie jeden region, a CLJ nie ma go wcale —
+    i dobrze, bo nazwy grup CLJ są unikalne w kraju.
+    UWAGA: gdybyśmy wzięli region uzupełniony z klubu, jedna grupa CLJ rozpadłaby się
+    na kilkanaście regionalnych kawałków."""
+    if "play_id" not in m.columns:
+        return
+    reg = (m["region_name"].fillna("").astype(str).str.strip()
+           if "region_name" in m.columns else pd.Series("", index=m.index))
+    for pid, r in zip(m["play_id"].astype(str).str.strip(), reg):
+        play_reg.setdefault(pid, Counter())[r] += 1
+
+
+def _liga_key(play_name, play_id, play_reg):
+    """Identyfikator KONKRETNYCH rozgrywek: nazwa + region.
+
+    Sama nazwa nie wystarcza — „I liga wojewódzka A1 Junior” ma 8 różnych play_id,
+    po jednym na województwo. Samo play_id też nie, bo runda jesienna i wiosenna
+    to osobne play_id tej samej ligi. league_id jest bezużyteczny (to kategoria:
+    wszystkie A1 w Polsce dzielą jeden league_id).
+    Nazwa jest już znormalizowana (bez „(RW)”), więc rundy scalają się same."""
+    nm = str(play_name)
+    reg = play_reg.get(str(play_id).strip(), "")
+    return f"{nm} · {reg}" if reg else nm
+
+
 def _collect_regions(m, team_reg, club_reg, t2cid):
     """Zbiera region po drużynie i po klubie. CLJ nie ma regionu — ale ten sam klub
     gra lokalnie w swoim województwie, więc region bierzemy z dowolnej jego drużyny."""
@@ -403,7 +430,7 @@ def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name):
     shutil.rmtree(SPLIT_DIR, ignore_errors=True)
     os.makedirs(SPLIT_DIR, exist_ok=True)
     part = 0
-    team_reg, club_reg, female_ids = {}, defaultdict(Counter), set()
+    team_reg, club_reg, female_ids, play_reg = {}, defaultdict(Counter), set(), {}
     for path in inputs:
         enc = _detect_encoding(path)
         print(f"\n→ split {path} (enc={enc})")
@@ -411,6 +438,7 @@ def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name):
             m = _prep_chunk(chunk, fin, pew, tmap, cmap, t2c, man_id, man_name)
             _collect_regions(m, team_reg, club_reg, t2cid)
             _collect_female_ids(m, female_ids)
+            _collect_play_regions(m, play_reg)
             for Y, sub in m.groupby(m["rocznik_final"].astype(int)):
                 d = os.path.join(SPLIT_DIR, f"rocznik={int(Y)}")
                 os.makedirs(d, exist_ok=True)
@@ -420,11 +448,16 @@ def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name):
     club_best = {cid: c.most_common(1)[0][0] for cid, c in club_reg.items() if c}
     print(f"\n  region: z drużyn {len(team_reg)} | z klubów {len(club_best)}")
     print(f"  zawodniczki wykryte po rozgrywkach kobiecych: {len(female_ids)}")
-    return team_reg, club_best, female_ids
+    play_best = {pid: c.most_common(1)[0][0] for pid, c in play_reg.items() if c}
+    n_reg = sum(1 for v in play_best.values() if v)
+    print(f"  rozgrywki (play_id): {len(play_best)} | z regionem: {n_reg} | "
+          f"bez regionu (CLJ/centralne): {len(play_best) - n_reg}")
+    return team_reg, club_best, female_ids, play_best
 
 
 # ── ETAP 2: agregacja jednego rocznika ───────────────────────────────────────
-def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None, female_ids=None):
+def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None, female_ids=None,
+                      play_reg=None):
     m = pd.read_parquet(os.path.join(SPLIT_DIR, f"rocznik={Y}"))
     if female_ids:
         m = m[~m["player_id"].astype(str).isin(female_ids)]
@@ -502,9 +535,14 @@ def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None, female_ids=No
                                .reset_index().sort_values("_w", ascending=False)
                                .groupby("player_id")["league_name"].first().reindex(out.index))
     if "play_name" in m.columns:
-        out["play_glowna"] = (m.assign(_w=mn).groupby(["player_id", "play_name"])["_w"].sum()
+        # KLUCZ rozgrywek = nazwa + region. Bez regionu „I liga wojewódzka A1” zlewałaby
+        # w jedno 8 różnych lig wojewódzkich i „Twoja liga” nie różniłaby się od „Twoje rozgrywki”.
+        pr = play_reg or {}
+        m = m.assign(_lk=[_liga_key(n, p, pr) for n, p in
+                          zip(m["play_name"], m.get("play_id", pd.Series("", index=m.index)))])
+        out["play_glowna"] = (m.assign(_w=mn).groupby(["player_id", "_lk"])["_w"].sum()
                               .reset_index().sort_values("_w", ascending=False)
-                              .groupby("player_id")["play_name"].first().reindex(out.index))
+                              .groupby("player_id")["_lk"].first().reindex(out.index))
     else:
         out["play_glowna"] = np.nan
     sz = (m[m["_szcz"] > 0].assign(_w=mn[m["_szcz"] > 0]).groupby(["player_id", "_szcz"])["_w"].sum()
@@ -541,7 +579,8 @@ def main():
     import pyarrow.parquet as pq
 
     print("\n=== ETAP 1: rozdział po skorygowanym roczniku ===")
-    team_reg, club_reg, female_ids = split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name)
+    team_reg, club_reg, female_ids, play_reg = split_inputs(
+        inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name)
     roczniki = sorted(int(d.split("=")[1]) for d in os.listdir(SPLIT_DIR)
                       if d.startswith("rocznik="))
     print(f"\nRoczniki do agregacji: {roczniki}")
@@ -549,7 +588,7 @@ def main():
     print("\n=== ETAP 2: agregacja per rocznik ===")
     all_agg = []
     for Y in roczniki:
-        agg, matches = aggregate_rocznik(Y, team_reg, club_reg, t2cid, female_ids)
+        agg, matches = aggregate_rocznik(Y, team_reg, club_reg, t2cid, female_ids, play_reg)
         if agg is None:
             continue
         all_agg.append(agg)

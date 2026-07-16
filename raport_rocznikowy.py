@@ -38,7 +38,7 @@ from app import compute_pm_score, _coerce, _cat_maxyear_series, _secret
 
 CURRENT_SEASON = _secret("PM_SEASON_ID", "e9d66181-d03e-4bb3-b889-4da848f4831d")
 DATA_MODE = (_secret("PM_DATA_MODE", "csv") or "csv").lower()
-MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "300") or "300"))
+MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "1000") or "1000"))
 
 AGG_PATH = _secret("PM_AGG", "data/kohorta_agg.parquet")
 MATCHES_DIR = _secret("PM_MATCHES", "data/matches")

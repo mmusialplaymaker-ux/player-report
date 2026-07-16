@@ -101,6 +101,12 @@ _EXPECTED_AGE = {1: 19, 2: 19, 3: 19, 4: 18, 5: 17, 6: 17, 7: 16,
 # Bez tego rank_l był pusty dla seniorów -> exp_age NaN -> dd NaN -> disc twardo 1.00,
 # czyli 15-latek w 2. lidze nie dostawał nic za najtrudniejszą rzecz, jaką może zrobić.
 SENIOR_EXPECTED_AGE = 19
+
+# Skok wiekowy (ageDiscount) liczy się PROPORCJONALNIE do siły rozgrywek, do których
+# zawodnik skacze. Gra 5 lat w górę w wiejskiej III lidze okręgowej A1 to zwykle brak
+# odpowiedniej drużyny w klubie, a nie talent — i nie może bić CLJ U-15 w akademii.
+# Przy leagueMultiplier >= SKOK_LM_REF premia działa w pełni (CLJ, ligi seniorskie).
+SKOK_LM_REF = 0.30
 SENIOR_LR = {
     "337bb869-0b42-484f-8eca-0c8842a13ec9": 1.0,    # Ekstraklasa
     "50e40483-e8dc-4e4b-9f58-a83f93a54d9a": 0.9,    # 1 liga
@@ -315,6 +321,13 @@ def compute_pm_score(df):
     age = pd.to_numeric(df.get("age_at_match"), errors="coerce")
     age = age.fillna(exp_age).fillna(OPTIMAL_AGE)
 
+    # leagueMultiplier: młodzież z rank_p (v7), reszta z produkcyjnej mapy seniorskiej
+    # (liczony PRZED agePart, bo waży premię za skok wiekowy — patrz SKOK_LM_REF)
+    youth_lm = rank_l.map(_BASE_RATIO) * (LVL_DECAY ** rank_p)
+    senior_lm = (df["league_id"].astype(str).map(SENIOR_LR).fillna(0.4)
+                 if "league_id" in df.columns else pd.Series(0.4, index=idx))
+    lm = youth_lm.where(is_youth, senior_lm)
+
     # agePart = AGE_IMPACT * AGE_CONST * sqrt(max(0, 1-(age-26)/26)) * ageDiscount(v7)
     normalized = (1 - (age - OPTIMAL_AGE) / OPTIMAL_AGE).clip(lower=0)
     age_base = AGE_IMPACT * AGE_CONST * np.sqrt(normalized)
@@ -324,13 +337,9 @@ def compute_pm_score(df):
     disc = pd.Series(np.select(
         [dd >= 8, dd == 7, dd == 6, dd == 5, dd == 4, dd == 3, dd == 2, dd == 1],
         [1.70, 1.60, 1.50, 1.40, 1.30, 1.20, 1.10, 1.05], default=1.0), index=idx)
+    # premia za skok wiekowy proporcjonalna do siły ligi, do której zawodnik skacze
+    disc = 1.0 + (disc - 1.0) * (lm / SKOK_LM_REF).clip(upper=1.0)
     age_part = age_base * disc
-
-    # leagueMultiplier: młodzież z rank_p (v7), reszta z produkcyjnej mapy seniorskiej
-    youth_lm = rank_l.map(_BASE_RATIO) * (LVL_DECAY ** rank_p)
-    senior_lm = (df["league_id"].astype(str).map(SENIOR_LR).fillna(0.4)
-                 if "league_id" in df.columns else pd.Series(0.4, index=idx))
-    lm = youth_lm.where(is_youth, senior_lm)
 
     res = df["match_result"].astype(str).str.lower()
     mn = pd.to_numeric(df["minutes"], errors="coerce").fillna(0)

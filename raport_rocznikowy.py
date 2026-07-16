@@ -39,6 +39,9 @@ from app import compute_pm_score, _coerce, _cat_maxyear_series, _secret
 CURRENT_SEASON = _secret("PM_SEASON_ID", "e9d66181-d03e-4bb3-b889-4da848f4831d")
 DATA_MODE = (_secret("PM_DATA_MODE", "csv") or "csv").lower()
 MIN_MIN_DEFAULT = int(float(_secret("PM_MIN_MINUTES", "1000") or "1000"))
+# Najmłodszy rocznik w ofercie. Dla młodszych (2012+) nie ma CLJ, więc ranking jest
+# zdominowany przez dzieci grające w górę w klubach bez odpowiedniej kategorii.
+MAX_ROCZNIK = int(float(_secret("PM_MAX_ROCZNIK", "2011") or "2011"))
 
 AGG_PATH = _secret("PM_AGG", "data/kohorta_agg.parquet")
 MATCHES_DIR = _secret("PM_MATCHES", "data/matches")
@@ -865,7 +868,11 @@ def pick_requester(agg):
         choice = st.sidebar.selectbox("Zawodnik", list(labels.keys()))
         req = agg[agg["player_id"] == labels[choice]].iloc[0]
 
-    years = sorted(agg["rocznik_final"].dropna().astype(int).unique())
+    years = [y for y in sorted(agg["rocznik_final"].dropna().astype(int).unique())
+             if y <= MAX_ROCZNIK]
+    if not years:
+        st.error(f"Brak roczników <= {MAX_ROCZNIK} w danych.")
+        return None, None
     default_y = int(req["rocznik_final"]) if pd.notna(req["rocznik_final"]) else years[-1]
     if qp_rok and str(qp_rok).isdigit() and int(qp_rok) in years:
         declared_y = int(qp_rok)

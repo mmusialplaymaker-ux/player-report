@@ -45,10 +45,28 @@ CHUNK = 400_000
 MALE_EXCEPTIONS = {"kuba", "luka", "nikita", "barnaba", "ilia", "illya", "mikita", "danila",
                    "oleksa", "seva", "diaa", "dima", "mykola", "mykyta", "ilya", "illia"}
 
+# Imiona żeńskie, których NIE łapie reguła „kończy się na -a” (obce). Uzupełniaj wg potrzeb.
+FEMALE_NAMES = {"jacqueline", "kathrin", "annabel", "chanel", "ines", "nicole", "michelle",
+                "ingrid", "astrid", "doris", "miriam", "rachel", "esther", "judith", "vivien",
+                "jennifer", "jessica", "carmen", "sarah", "hannah", "elisabeth", "kristin"}
+
+# Rozgrywki kobiece — kto tu zagrał, jest zawodniczką (sygnał pewniejszy niż imię).
+_FEM_COMP = re.compile(r"kobiet|kobieca|\bwomen\b|dziewcz|juniorek", re.IGNORECASE)
+
 
 def _is_female(firstname):
     f = str(firstname).strip().lower()
-    return f.endswith("a") and f not in MALE_EXCEPTIONS
+    return f in FEMALE_NAMES or (f.endswith("a") and f not in MALE_EXCEPTIONS)
+
+
+def _collect_female_ids(m, female_ids):
+    """Zbiera player_id z rozgrywek kobiecych. Filtr nakładamy dopiero w agregacji,
+    bo mecz kobiecy może być w innym chunku niż reszta sezonu zawodniczki."""
+    txt = (m.get("play_name", pd.Series("", index=m.index)).fillna("").astype(str) + " "
+           + m.get("league_name", pd.Series("", index=m.index)).fillna("").astype(str))
+    hit = txt.str.contains(_FEM_COMP)
+    if hit.any():
+        female_ids.update(m.loc[hit, "player_id"].astype(str).unique())
 
 
 SZCZEBEL_NAZWA = {5: "CLJ / Makroregionalna", 4: "I liga wojewódzka", 3: "II liga wojewódzka",
@@ -361,13 +379,14 @@ def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name):
     shutil.rmtree(SPLIT_DIR, ignore_errors=True)
     os.makedirs(SPLIT_DIR, exist_ok=True)
     part = 0
-    team_reg, club_reg = {}, defaultdict(Counter)
+    team_reg, club_reg, female_ids = {}, defaultdict(Counter), set()
     for path in inputs:
         enc = _detect_encoding(path)
         print(f"\n→ split {path} (enc={enc})")
         for ci, chunk in enumerate(pd.read_csv(path, encoding=enc, chunksize=CHUNK, low_memory=False)):
             m = _prep_chunk(chunk, fin, pew, tmap, cmap, t2c, man_id, man_name)
             _collect_regions(m, team_reg, club_reg, t2cid)
+            _collect_female_ids(m, female_ids)
             for Y, sub in m.groupby(m["rocznik_final"].astype(int)):
                 d = os.path.join(SPLIT_DIR, f"rocznik={int(Y)}")
                 os.makedirs(d, exist_ok=True)
@@ -376,12 +395,17 @@ def split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name):
             print(f"   chunk {ci}: {len(m)} wierszy → roczniki {sorted(m['rocznik_final'].astype(int).unique().tolist())}")
     club_best = {cid: c.most_common(1)[0][0] for cid, c in club_reg.items() if c}
     print(f"\n  region: z drużyn {len(team_reg)} | z klubów {len(club_best)}")
-    return team_reg, club_best
+    print(f"  zawodniczki wykryte po rozgrywkach kobiecych: {len(female_ids)}")
+    return team_reg, club_best, female_ids
 
 
 # ── ETAP 2: agregacja jednego rocznika ───────────────────────────────────────
-def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None):
+def aggregate_rocznik(Y, team_reg=None, club_reg=None, t2cid=None, female_ids=None):
     m = pd.read_parquet(os.path.join(SPLIT_DIR, f"rocznik={Y}"))
+    if female_ids:
+        m = m[~m["player_id"].astype(str).isin(female_ids)]
+    if not len(m):
+        return None, None
     m["match_date"] = pd.to_datetime(m["match_date"], errors="coerce")
     m["rocznik_final"] = pd.to_numeric(m["rocznik_final"], errors="coerce")
 
@@ -487,7 +511,7 @@ def main():
     import pyarrow.parquet as pq
 
     print("\n=== ETAP 1: rozdział po skorygowanym roczniku ===")
-    team_reg, club_reg = split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name)
+    team_reg, club_reg, female_ids = split_inputs(inputs, fin, pew, tmap, cmap, t2c, t2cid, man_id, man_name)
     roczniki = sorted(int(d.split("=")[1]) for d in os.listdir(SPLIT_DIR)
                       if d.startswith("rocznik="))
     print(f"\nRoczniki do agregacji: {roczniki}")
@@ -495,7 +519,9 @@ def main():
     print("\n=== ETAP 2: agregacja per rocznik ===")
     all_agg = []
     for Y in roczniki:
-        agg, matches = aggregate_rocznik(Y, team_reg, club_reg, t2cid)
+        agg, matches = aggregate_rocznik(Y, team_reg, club_reg, t2cid, female_ids)
+        if agg is None:
+            continue
         all_agg.append(agg)
         matches["rocznik_final"] = matches["rocznik_final"].astype("int64")
         pq.write_to_dataset(pa.Table.from_pandas(matches, preserve_index=False),
